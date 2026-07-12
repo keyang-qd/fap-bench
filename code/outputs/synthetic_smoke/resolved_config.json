@@ -1,0 +1,69 @@
+{
+  "seed": 7,
+  "device": "cpu",
+  "torch_num_threads": 1,
+  "output_dir": "outputs/synthetic_smoke",
+  "data": {
+    "path": "data/synthetic.parquet",
+    "date_col": "date",
+    "entity_col": "permno",
+    "target_col": "retadj_1mn",
+    "target_shift_months": 0,
+    "excluded_columns": [
+      "sic2"
+    ],
+    "scaling": "global"
+  },
+  "split": {
+    "ratios": [
+      0.6,
+      0.2,
+      0.2
+    ]
+  },
+  "partition": {
+    "type": "domain",
+    "domain_col": "sic2",
+    "max_clients": 6
+  },
+  "feature_heterogeneity": {
+    "enabled": true,
+    "common_fraction": 0.5,
+    "private_fraction": 0.5
+  },
+  "model": {
+    "hidden_dims": [
+      16,
+      8
+    ],
+    "dropout": 0.0,
+    "batch_norm": false
+  },
+  "baselines": {
+    "centralized": true,
+    "local": true,
+    "epochs": 1
+  },
+  "federated": {
+    "algorithms": [
+      "fedavg",
+      "fedprox",
+      "scaffold",
+      "fedadam"
+    ],
+    "rounds": 2,
+    "local_epochs": 1,
+    "batch_size": 128,
+    "client_lr": 0.003,
+    "weight_decay": 0.0,
+    "proximal_mu": 0.01,
+    "participation_rate": 0.67,
+    "server_lr": 0.01
+  },
+  "evaluation": {
+    "portfolio_quantile": 0.2,
+    "transaction_cost_bps": 10,
+    "periods_per_year": 12
+  },
+  "_config_path": "/mnt/data/fapbench/configs/synthetic_smoke.yaml"
+}

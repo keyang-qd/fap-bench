@@ -1,0 +1,3 @@
+round,algorithm,active_clients,mean_train_loss,communicated_parameters
+1,fedavg,6,0.03266082797199488,3468
+2,fedavg,6,0.028288837211827438,3468
