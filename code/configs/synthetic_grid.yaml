@@ -1,0 +1,51 @@
+base_config: synthetic_smoke.yaml
+output_dir: outputs/synthetic_grid
+seeds: [7]
+
+scenarios:
+  - name: iid_easy
+    overrides:
+      partition:
+        type: iid
+        num_clients: 6
+      feature_heterogeneity:
+        enabled: false
+      federated:
+        participation_rate: 1.0
+
+  - name: sector_domain
+    overrides:
+      partition:
+        type: domain
+        domain_col: sic2
+        max_clients: 6
+      feature_heterogeneity:
+        enabled: false
+      federated:
+        participation_rate: 1.0
+
+  - name: feature_moderate
+    overrides:
+      partition:
+        type: domain
+        domain_col: sic2
+        max_clients: 6
+      feature_heterogeneity:
+        enabled: true
+        common_fraction: 0.5
+        private_fraction: 0.5
+      federated:
+        participation_rate: 1.0
+
+  - name: combined_severe
+    overrides:
+      partition:
+        type: domain
+        domain_col: sic2
+        max_clients: 6
+      feature_heterogeneity:
+        enabled: true
+        common_fraction: 0.2
+        private_fraction: 0.4
+      federated:
+        participation_rate: 0.5

@@ -1,0 +1,79 @@
+seed: 42
+device: cpu
+torch_num_threads: 1
+output_dir: outputs/crsp_compustat_profitability
+
+data:
+  path: /path/to/profitability_panel_revised.parquet
+  source_profile: crsp_compustat_profitability_v2
+  date_col: formation_date
+  entity_col: permno
+  target_col: retadj_1mn
+  target_shift_months: 0
+  target_date_col: target_date
+  target_period_col: target_year_month
+  require_unique_entity_month: true
+  validate_target_alignment: true
+  feature_columns:
+    - gpoa_zscore
+    - roa_zscore
+    - roe_zscore
+    - roic_zscore
+    - opoa_zscore
+    - gmar_zscore
+    - fcfoa_zscore
+  # These variables are already cross-sectionally ranked and z-scored by month.
+  # profitability_simple is excluded because it is a deterministic composite of
+  # the seven inputs and would leak masked components in feature-heterogeneity tests.
+  scaling: none
+
+split:
+  date_col: target_date
+  train_end: 2014-12-31
+  val_end: 2018-12-31
+
+partition:
+  type: domain
+  domain_col: sic
+  transform: ff12
+  output_col: ff12
+  drop_missing_domain: true
+  persistent_entity: false
+
+feature_heterogeneity:
+  enabled: false
+  common_fraction: 1.0
+  private_fraction: 0.5
+
+model:
+  hidden_dims: [64, 32]
+  dropout: 0.1
+  batch_norm: false
+
+baselines:
+  centralized: true
+  centralized_masked: true
+  local: true
+  epochs: 10
+
+federated:
+  algorithms: [fedavg, fedprox, scaffold, fedadam]
+  rounds: 50
+  local_epochs: 1
+  batch_size: 2048
+  client_optimizer: sgd
+  client_momentum: 0.0
+  client_lr: 0.01
+  weight_decay: 0.0001
+  proximal_mu: 0.01
+  participation_rate: 1.0
+  server_lr: 0.01
+  server_beta1: 0.9
+  server_beta2: 0.99
+  server_tau: 1.0e-8
+
+evaluation:
+  date_col: target_date
+  portfolio_quantile: 0.1
+  transaction_cost_bps: 10
+  periods_per_year: 12

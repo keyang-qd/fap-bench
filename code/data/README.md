@@ -1,0 +1,1 @@
+Synthetic and production Parquet files are intentionally not bundled. Generate the synthetic smoke-test panel with `scripts/make_synthetic.py` and point the financial YAML to the output of `scripts/data_recipe2_revised.py`.
