@@ -1,3 +1,0 @@
-round,algorithm,active_clients,mean_train_loss,communicated_parameters
-1,fedadam,6,0.031460617668926716,3468
-2,fedadam,6,0.020121518522500992,3468

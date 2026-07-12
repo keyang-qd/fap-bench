@@ -1,3 +1,0 @@
-round,algorithm,active_clients,mean_train_loss,communicated_parameters
-1,fedprox,6,0.031460617668926716,3468
-2,fedprox,6,0.027314072474837303,3468
