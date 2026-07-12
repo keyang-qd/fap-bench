@@ -9,11 +9,11 @@ import pandas as pd
 
 
 DEFAULT_EXCLUDE = {
-    "permno", "gvkey", "cusip", "ticker", "date", "datadate", "year_month",
-    "year", "fyear", "client_id", "split", "ret", "retx", "retadj",
-    "retadj_1mn", "target", "label", "port_weight", "shares", "shares_last",
-    "shares_chg", "prc", "shrout", "me", "me_lag", "shrcd", "exchcd",
-    "cfacpr", "cfacshr",
+    "permno", "gvkey", "cusip", "ticker", "date", "target_date", "datadate",
+    "year_month", "year", "fyear", "sic", "sic2", "naics", "sector",
+    "client_id", "split", "ret", "retx", "retadj", "retadj_1mn",
+    "target", "label", "port_weight", "shares", "shares_last", "shares_chg",
+    "prc", "shrout", "me", "me_lag", "shrcd", "exchcd", "cfacpr", "cfacshr",
 }
 
 
@@ -23,9 +23,11 @@ class PanelSpec:
     entity_col: str = "permno"
     target_col: str = "retadj_1mn"
     target_shift_months: int = 0
+    target_date_col: str = "target_date"
     feature_columns: tuple[str, ...] | None = None
     excluded_columns: tuple[str, ...] = ()
     min_feature_coverage: float = 0.5
+    require_unique_entity_month: bool = True
 
 
 def load_panel(path: str | Path) -> pd.DataFrame:
@@ -52,7 +54,7 @@ def infer_feature_columns(frame: pd.DataFrame, spec: PanelSpec) -> list[str]:
         return list(spec.feature_columns)
 
     excluded = DEFAULT_EXCLUDE | set(spec.excluded_columns) | {
-        spec.date_col, spec.entity_col, spec.target_col
+        spec.date_col, spec.entity_col, spec.target_col, spec.target_date_col
     }
     numeric = [
         col for col in frame.select_dtypes(include=[np.number, "bool"]).columns
@@ -70,6 +72,50 @@ def infer_feature_columns(frame: pd.DataFrame, spec: PanelSpec) -> list[str]:
     return kept
 
 
+def _align_target_by_calendar_month(data: pd.DataFrame, spec: PanelSpec) -> pd.DataFrame:
+    """Align a raw monthly target to an exact future calendar month.
+
+    A positive horizon h maps features dated in month t to the target observed in
+    month t+h for the same security. This deliberately uses an entity-month join
+    rather than ``groupby().shift()`` so a missing calendar month is not silently
+    interpreted as a one-month-ahead observation.
+    """
+    output = data.copy()
+    feature_period = output[spec.date_col].dt.to_period("M")
+
+    if spec.target_shift_months == 0:
+        output[spec.target_date_col] = output[spec.date_col]
+        return output
+    if spec.target_shift_months < 0:
+        raise ValueError("target_shift_months must be non-negative.")
+
+    lookup = output[[spec.entity_col, spec.date_col, spec.target_col]].copy()
+    lookup["_target_period"] = lookup[spec.date_col].dt.to_period("M")
+    lookup = lookup.rename(
+        columns={spec.target_col: "_aligned_target", spec.date_col: spec.target_date_col}
+    )
+
+    duplicate_lookup = lookup.duplicated([spec.entity_col, "_target_period"], keep=False)
+    if duplicate_lookup.any():
+        examples = lookup.loc[duplicate_lookup, [spec.entity_col, "_target_period"]].head(5)
+        raise ValueError(
+            "Cannot align future targets because entity-month keys are duplicated. "
+            f"Examples: {examples.to_dict(orient='records')}"
+        )
+
+    output["_target_period"] = feature_period + spec.target_shift_months
+    output = output.drop(columns=[spec.target_date_col], errors="ignore")
+    output = output.merge(
+        lookup[[spec.entity_col, "_target_period", "_aligned_target", spec.target_date_col]],
+        on=[spec.entity_col, "_target_period"],
+        how="left",
+        validate="many_to_one",
+    )
+    output[spec.target_col] = output.pop("_aligned_target")
+    output = output.drop(columns=["_target_period"])
+    return output
+
+
 def prepare_panel(frame: pd.DataFrame, spec: PanelSpec) -> tuple[pd.DataFrame, list[str]]:
     required = {spec.date_col, spec.entity_col, spec.target_col}
     missing = sorted(required - set(frame.columns))
@@ -81,20 +127,96 @@ def prepare_panel(frame: pd.DataFrame, spec: PanelSpec) -> tuple[pd.DataFrame, l
     data = data.dropna(subset=[spec.date_col, spec.entity_col])
     data = data.sort_values([spec.entity_col, spec.date_col]).reset_index(drop=True)
 
-    if spec.target_shift_months:
-        # A positive value predicts a future target. For example, 1 maps features
-        # at t to the raw target observed at t+1 within each security.
-        data[spec.target_col] = data.groupby(spec.entity_col, sort=False)[
-            spec.target_col
-        ].shift(-spec.target_shift_months)
+    entity_month = pd.DataFrame({
+        spec.entity_col: data[spec.entity_col],
+        "_month": data[spec.date_col].dt.to_period("M"),
+    })
+    duplicates = entity_month.duplicated([spec.entity_col, "_month"], keep=False)
+    if spec.require_unique_entity_month and duplicates.any():
+        examples = entity_month.loc[duplicates].head(5).to_dict(orient="records")
+        raise ValueError(
+            "The panel must contain at most one row per entity-month. "
+            f"Examples of duplicates: {examples}"
+        )
+
+    # The uploaded CRSP/Compustat recipe sets retadj_1mn = retadj in the same
+    # month. Use target_shift_months=1 to form the economically correct t -> t+1
+    # prediction problem.
+    data = _align_target_by_calendar_month(data, spec)
 
     features = infer_feature_columns(data, spec)
     for col in features + [spec.target_col]:
         data[col] = pd.to_numeric(data[col], errors="coerce")
 
     data = data.replace([np.inf, -np.inf], np.nan)
-    data = data.dropna(subset=[spec.target_col]).reset_index(drop=True)
+    data = data.dropna(subset=[spec.target_col, spec.target_date_col]).reset_index(drop=True)
     return data, features
+
+
+def validate_crsp_compustat_profitability_panel(frame: pd.DataFrame) -> dict[str, object]:
+    """Generate data-quality diagnostics for the user's data_recipe2 output."""
+    report: dict[str, object] = {
+        "n_rows": int(len(frame)),
+        "n_columns": int(frame.shape[1]),
+    }
+    if "permno" in frame:
+        report["n_entities"] = int(frame["permno"].nunique(dropna=True))
+    if "date" in frame:
+        dates = pd.to_datetime(frame["date"], errors="coerce")
+        report["date_min"] = None if dates.dropna().empty else str(dates.min().date())
+        report["date_max"] = None if dates.dropna().empty else str(dates.max().date())
+    else:
+        dates = pd.Series(pd.NaT, index=frame.index)
+
+    if {"permno", "date"}.issubset(frame.columns):
+        months = dates.dt.to_period("M")
+        report["duplicate_entity_month_rows"] = int(
+            pd.DataFrame({"permno": frame["permno"], "month": months})
+            .duplicated(["permno", "month"], keep=False)
+            .sum()
+        )
+        report["duplicate_entity_date_rows"] = int(
+            frame.assign(_date=dates).duplicated(["permno", "_date"], keep=False).sum()
+        )
+
+    if "year_month" in frame and "date" in frame:
+        recipe_month = frame["year_month"].astype(str)
+        date_month = dates.dt.to_period("M").astype(str)
+        valid = dates.notna() & frame["year_month"].notna()
+        report["date_year_month_mismatch_rows"] = int((recipe_month[valid] != date_month[valid]).sum())
+
+    if {"retadj_1mn", "retadj"}.issubset(frame.columns):
+        left = pd.to_numeric(frame["retadj_1mn"], errors="coerce")
+        right = pd.to_numeric(frame["retadj"], errors="coerce")
+        valid = left.notna() & right.notna()
+        report["retadj_1mn_equals_same_month_retadj_share"] = (
+            float(np.isclose(left[valid], right[valid], equal_nan=False).mean()) if valid.any() else None
+        )
+
+    if "shrcd" in frame:
+        shrcd = pd.to_numeric(frame["shrcd"], errors="coerce")
+        report["non_common_share_rows"] = int((shrcd.notna() & ~shrcd.isin([10, 11])).sum())
+    if "exchcd" in frame:
+        exchcd = pd.to_numeric(frame["exchcd"], errors="coerce")
+        report["non_major_exchange_rows"] = int((exchcd.notna() & ~exchcd.isin([1, 2, 3])).sum())
+
+    report["has_sic"] = bool("sic" in frame.columns)
+    report["has_sic2"] = bool("sic2" in frame.columns)
+    report["has_port_weight"] = bool("port_weight" in frame.columns)
+
+    zscore_cols = [
+        c for c in [
+            "gpoa_zscore", "roa_zscore", "roe_zscore", "roic_zscore",
+            "opoa_zscore", "gmar_zscore", "fcfoa_zscore"
+        ] if c in frame.columns
+    ]
+    report["available_profitability_features"] = zscore_cols + (
+        ["profitability_simple"] if "profitability_simple" in frame.columns else []
+    )
+    report["recommended_target_shift_months"] = 1
+    report["recommended_scaling"] = "none"
+    report["recommended_domain_column"] = "sic2 (retain/derive it in data_recipe2)"
+    return report
 
 
 def split_by_time(

@@ -14,7 +14,7 @@ A compact, reproducible implementation of the minimum viable benchmark proposed 
 
 The supplied `sample(1).parquet` contains only 10 rows for a single `permno`. It is sufficient to verify the schema, but **not** sufficient for federated training or a cross-sectional portfolio. The full panel should contain many securities, many dates, and at least two domain groups.
 
-The supplied sample contains no SIC/NAICS/sector field. The benchmark accepts any configured domain column. For the full study, add `sic2`, `naics2`, or a sector label. `exchcd` and `me`-quantile clients are supported as fallbacks, but they should not be presented as a substitute for sector heterogeneity without justification.
+The supplied sample contains no SIC/NAICS/sector field because `data_recipe2` uses `sic` for imputation but drops it from the final selected columns. Retain `sic`, derive `sic2`, and use it for the initial domain partition. `exchcd` and market-size clients remain diagnostic fallbacks rather than substitutes for industry heterogeneity.
 
 ## Installation
 
@@ -36,14 +36,15 @@ Main results appear in `outputs/synthetic_smoke/benchmark_results.csv`.
 
 ## Run on the full financial panel
 
-1. Edit `configs/sample_parquet.yaml`.
+1. Start from `configs/crsp_compustat_profitability.yaml`.
 2. Replace `data.path` with the full Parquet file.
-3. Set `partition.domain_col` to `sic2`, `naics2`, or your sector column.
-4. Confirm whether `retadj_1mn` is already forward aligned. Keep `target_shift_months: 0` when it is; use `1` only when the raw return must be shifted to t+1.
-5. Run:
+3. Retain `sic` in `data_recipe2` and derive `sic2`.
+4. Keep `target_shift_months: 1`: the recipe sets `retadj_1mn = retadj` in the same month.
+5. Keep `scaling: none` for the already cross-sectionally standardized profitability features.
+6. Run:
 
 ```bash
-python scripts/run_benchmark.py --config configs/sample_parquet.yaml
+python scripts/run_benchmark.py --config configs/crsp_compustat_profitability.yaml
 ```
 
 ## Experimental configurations for the paper
@@ -69,6 +70,7 @@ Create one YAML per scenario rather than using a full factorial design:
 
 ## Methodological cautions
 
+- Future returns are aligned by exact calendar month, not by the next available row. Splits use `target_date` by default to avoid horizon leakage at train/validation boundaries.
 - Fit preprocessing on the training period only; this implementation does so.
 - Preserve a stock's full history within one IID client to avoid a client definition that changes every month.
 - Report realized Jaccard feature dissimilarity rather than calling the configured common fraction “feature overlap.”
@@ -84,3 +86,6 @@ python scripts/plot_results.py --results outputs/synthetic_grid/grid_results.csv
 ```
 
 For the paper, use at least three seeds. The supplied synthetic grid uses one seed only to keep the smoke test fast.
+
+
+See `DATA_RECIPE_ALIGNMENT.md` for the source-script corrections, especially delisting-return combination and restricted forward filling.

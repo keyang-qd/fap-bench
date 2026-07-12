@@ -12,7 +12,14 @@ import torch
 from fapbench.algorithms import FederatedTrainer, train_centralized, train_local_models
 from fapbench.algorithms.common import frame_to_arrays
 from fapbench.config import load_config
-from fapbench.data import PanelPreprocessor, PanelSpec, load_panel, prepare_panel, split_by_time
+from fapbench.data import (
+    PanelPreprocessor,
+    PanelSpec,
+    load_panel,
+    prepare_panel,
+    split_by_time,
+    validate_crsp_compustat_profitability_panel,
+)
 from fapbench.evaluation import (
     client_averaged_long_short_metrics,
     client_predictive_metrics,
@@ -53,6 +60,7 @@ def _prediction_frame(
     client_col: str,
     device: str,
     feature_masks: Mapping[str, np.ndarray] | None = None,
+    target_date_col: str = "target_date",
 ) -> pd.DataFrame:
     rows: list[pd.DataFrame] = []
     device_obj = torch.device(device)
@@ -67,7 +75,10 @@ def _prediction_frame(
             raise ValueError("Non-finite evaluation rows remained after preprocessing.")
         with torch.no_grad():
             prediction = model(torch.as_tensor(x, dtype=torch.float32, device=device_obj)).cpu().numpy()
-        output = group[[date_col, entity_col, client_col]].copy()
+        output_columns = [date_col, entity_col, client_col]
+        if target_date_col in group.columns:
+            output_columns.append(target_date_col)
+        output = group[output_columns].copy()
         output[client_col] = output[client_col].astype(str)
         output["y_true"] = y
         output["y_pred"] = prediction
@@ -85,6 +96,7 @@ def _local_prediction_frame(
     client_col: str,
     device: str,
     feature_masks: Mapping[str, np.ndarray] | None = None,
+    target_date_col: str = "target_date",
 ) -> pd.DataFrame:
     rows: list[pd.DataFrame] = []
     for client_id, group in frame.groupby(client_col, sort=True):
@@ -94,7 +106,7 @@ def _local_prediction_frame(
         rows.append(
             _prediction_frame(
                 models[client_id], group, features, target_col, date_col,
-                entity_col, client_col, device, feature_masks
+                entity_col, client_col, device, feature_masks, target_date_col
             )
         )
     return pd.concat(rows, ignore_index=True)
@@ -145,6 +157,11 @@ def run(config: dict[str, Any]) -> Path:
 
     data_cfg = config["data"]
     raw = load_panel(data_cfg["path"])
+    if data_cfg.get("source_profile") == "crsp_compustat_profitability_v1":
+        write_json(
+            validate_crsp_compustat_profitability_panel(raw),
+            output_dir / "source_validation.json",
+        )
     features_cfg = data_cfg.get("feature_columns")
     spec = PanelSpec(
         date_col=data_cfg.get("date_col", "date"),
@@ -154,12 +171,18 @@ def run(config: dict[str, Any]) -> Path:
         feature_columns=tuple(features_cfg) if features_cfg else None,
         excluded_columns=tuple(data_cfg.get("excluded_columns", [])),
         min_feature_coverage=float(data_cfg.get("min_feature_coverage", 0.5)),
+        target_date_col=data_cfg.get("target_date_col", "target_date"),
+        require_unique_entity_month=bool(data_cfg.get("require_unique_entity_month", True)),
     )
     panel, features = prepare_panel(raw, spec)
     split_cfg = config.get("split", {})
+    split_date_col = split_cfg.get(
+        "date_col",
+        spec.target_date_col if spec.target_shift_months > 0 else spec.date_col,
+    )
     panel = split_by_time(
         panel,
-        spec.date_col,
+        split_date_col,
         train_end=split_cfg.get("train_end"),
         val_end=split_cfg.get("val_end"),
         ratios=split_cfg.get("ratios", [0.6, 0.2, 0.2]),
@@ -214,7 +237,10 @@ def run(config: dict[str, Any]) -> Path:
     )
     heterogeneity["feature_columns"] = features
     write_json(heterogeneity, output_dir / "heterogeneity.json")
-    panel[[spec.date_col, spec.entity_col, "client_id", "split"]].to_parquet(
+    assignment_columns = [spec.date_col, spec.entity_col, "client_id", "split"]
+    if spec.target_date_col in panel.columns:
+        assignment_columns.append(spec.target_date_col)
+    panel[assignment_columns].to_parquet(
         output_dir / "partition_assignments.parquet", index=False
     )
     if feature_masks:
@@ -241,7 +267,8 @@ def run(config: dict[str, Any]) -> Path:
         )
         predictions = _prediction_frame(
             centralized, test, features, spec.target_col, spec.date_col,
-            spec.entity_col, "client_id", device, feature_masks=None
+            spec.entity_col, "client_id", device, feature_masks=None,
+            target_date_col=spec.target_date_col,
         )
         metrics = _evaluate_and_save("centralized", predictions, output_dir, config)
         results.append({"method": "centralized", **metrics})
@@ -259,7 +286,8 @@ def run(config: dict[str, Any]) -> Path:
         )
         predictions = _local_prediction_frame(
             local_models, test, features, spec.target_col, spec.date_col,
-            spec.entity_col, "client_id", device, feature_masks
+            spec.entity_col, "client_id", device, feature_masks,
+            target_date_col=spec.target_date_col,
         )
         metrics = _evaluate_and_save("local", predictions, output_dir, config)
         results.append({"method": "local", **metrics})
@@ -289,7 +317,8 @@ def run(config: dict[str, Any]) -> Path:
         trainer.history.to_frame().to_csv(output_dir / f"training_{algorithm}.csv", index=False)
         predictions = _prediction_frame(
             model, test, features, spec.target_col, spec.date_col,
-            spec.entity_col, "client_id", device, feature_masks
+            spec.entity_col, "client_id", device, feature_masks,
+            target_date_col=spec.target_date_col,
         )
         metrics = _evaluate_and_save(algorithm, predictions, output_dir, config)
         metrics["communicated_parameters"] = int(

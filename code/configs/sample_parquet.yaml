@@ -8,8 +8,8 @@ data:
   date_col: date
   entity_col: permno
   target_col: retadj_1mn
-  # Set to 1 only when target_col is a contemporaneous raw return that must be shifted.
-  target_shift_months: 0
+  # data_recipe2 defines retadj_1mn = retadj, so use an exact calendar t+1 target.
+  target_shift_months: 1
   feature_columns:
     - gpoa_zscore
     - roa_zscore
@@ -19,7 +19,7 @@ data:
     - gmar_zscore
     - fcfoa_zscore
     - profitability_simple
-  scaling: global
+  scaling: none
 
 split:
   ratios: [0.6, 0.2, 0.2]

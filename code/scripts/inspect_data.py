@@ -4,10 +4,14 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
-from fapbench.data import PanelSpec, infer_feature_columns, load_panel
+from fapbench.data import (
+    PanelSpec,
+    infer_feature_columns,
+    load_panel,
+    validate_crsp_compustat_profitability_panel,
+)
 
 
 def main() -> None:
@@ -17,6 +21,11 @@ def main() -> None:
     parser.add_argument("--entity-col", default="permno")
     parser.add_argument("--target-col", default="retadj_1mn")
     parser.add_argument("--domain-col", default=None)
+    parser.add_argument(
+        "--source-profile",
+        choices=["generic", "crsp_compustat_profitability_v1"],
+        default="generic",
+    )
     args = parser.parse_args()
 
     frame = load_panel(args.path)
@@ -67,6 +76,20 @@ def main() -> None:
             report["n_domains"] = int(frame[args.domain_col].nunique(dropna=True))
             if report["n_domains"] < 2:
                 warnings.append("The domain column produces fewer than two clients.")
+
+    if args.source_profile == "crsp_compustat_profitability_v1":
+        report["source_validation"] = validate_crsp_compustat_profitability_panel(frame)
+        source = report["source_validation"]
+        if source.get("retadj_1mn_equals_same_month_retadj_share", 0) > 0.99:
+            warnings.append(
+                "retadj_1mn is contemporaneous retadj in this recipe; configure target_shift_months: 1."
+            )
+        if not source.get("has_sic2"):
+            warnings.append("Retain SIC and derive sic2 before using a sector/domain partition.")
+        if source.get("date_year_month_mismatch_rows", 0) > 0:
+            warnings.append(
+                "date and year_month disagree for some rows; broad forward filling may have fabricated market fields."
+            )
 
     report["warnings"] = warnings
     print(json.dumps(report, indent=2))
