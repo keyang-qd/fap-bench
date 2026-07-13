@@ -372,6 +372,12 @@ def run(config: dict[str, Any]) -> Path:
     )
 
     try:
+        # Serialize the resolved configuration before any expensive work.  This
+        # makes unsupported config types fail immediately rather than after a
+        # long benchmark run.
+        with log_stage(logger, "Validate and save resolved configuration"):
+            write_json(config, output_dir / "resolved_config.json")
+
         with log_stage(logger, "Load panel"):
             raw = load_panel(data_path)
             log_frame(
@@ -798,7 +804,6 @@ def run(config: dict[str, Any]) -> Path:
             results_frame.to_csv(
                 output_dir / "benchmark_results.csv", index=False
             )
-            write_json(config, output_dir / "resolved_config.json")
             logger.info(
                 "Benchmark methods complete | %s",
                 ", ".join(results_frame["method"].astype(str).tolist()),

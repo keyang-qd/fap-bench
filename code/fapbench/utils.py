@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import time
+from datetime import date, datetime, time as datetime_time
+from enum import Enum
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -28,24 +31,62 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def json_default(value: Any) -> Any:
-    if isinstance(value, (np.integer,)):
+    """Convert common scientific-Python/config values to JSON-safe objects.
+
+    PyYAML parses unquoted values such as ``2014-12-31`` as
+    :class:`datetime.date`.  Supporting standard-library dates here prevents a
+    completed benchmark from failing while writing ``resolved_config.json``.
+    """
+    if value is pd.NaT:
+        return None
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
         return int(value)
-    if isinstance(value, (np.floating,)):
+    if isinstance(value, np.floating):
         return float(value)
-    if isinstance(value, (np.ndarray,)):
+    if isinstance(value, np.ndarray):
         return value.tolist()
-    if isinstance(value, (pd.Timestamp, pd.Period)):
+    if isinstance(value, np.datetime64):
+        if np.isnat(value):
+            return None
+        return np.datetime_as_string(value)
+    if isinstance(value, (pd.Timestamp, pd.Period, pd.Timedelta)):
         return str(value)
+    if isinstance(value, (datetime, date, datetime_time)):
+        return value.isoformat()
     if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, (set, frozenset)):
+        return sorted(value, key=str)
+    if isinstance(value, torch.device):
         return str(value)
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def write_json(data: Any, path: str | Path) -> None:
+    """Write JSON atomically so failures never leave a truncated target file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2, default=json_default)
+    temporary_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            json.dump(
+                data,
+                handle,
+                indent=2,
+                default=json_default,
+                ensure_ascii=False,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
 
 
 def configure_logger(

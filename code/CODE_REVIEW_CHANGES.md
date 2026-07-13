@@ -18,3 +18,10 @@ The second audit identified and fixed the following inconsistencies:
 All items above are corrected in this package.
 13. Local-only models previously started from different random initializations across clients; they now share the same initial state.
 14. SCAFFOLD communication previously counted only model upload/download; control-variate communication is now included.
+
+## 2026-07-13: JSON date serialization and late-failure recovery
+
+- `json_default()` now supports Python `date`, `datetime`, and `time`, NumPy date/bool/scalar types, Pandas time types, `Path`, enums, sets, and `torch.device`.
+- JSON files are written atomically, so a serialization failure cannot leave a truncated destination file.
+- `resolved_config.json` is validated and saved before loading the panel or training models; unsupported configuration values now fail immediately.
+- Added `scripts/repair_completed_run.py` to recover a run that completed all models but failed while saving the resolved config. It does not retrain models.
