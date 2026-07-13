@@ -118,6 +118,7 @@ def train_one_client(
     logger: logging.Logger | None = None,
     log_prefix: str = "training",
     epoch_log_interval: int = 0,
+    epoch_end_callback: Callable[[nn.Module, int, float], None] | None = None,
 ) -> tuple[nn.Module, float]:
     model = model_fn().to(device)
     model.load_state_dict(global_state, strict=True)
@@ -207,6 +208,12 @@ def train_one_client(
                 local_epochs,
                 epoch_loss / max(epoch_count, 1),
                 format_seconds(time.perf_counter() - epoch_started),
+            )
+        if epoch_end_callback is not None:
+            epoch_end_callback(
+                model,
+                epoch_index + 1,
+                epoch_loss / max(epoch_count, 1),
             )
 
     mean_loss = total_loss / max(total_count, 1)

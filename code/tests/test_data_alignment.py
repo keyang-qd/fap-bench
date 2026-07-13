@@ -76,3 +76,31 @@ def test_pre_aligned_target_is_preserved_when_shift_is_zero():
     report = validate_crsp_compustat_profitability_panel(frame)
     assert report["target_alignment_status"] == "pre_aligned_exact_t_plus_1"
     assert report["recommended_target_shift_months"] == 0
+
+
+def test_universe_filter_supports_price_and_nyse_microcap_breakpoints():
+    from fapbench.data import apply_universe_filters
+
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(
+                ["2020-01-31"] * 5 + ["2020-02-29"] * 5
+            ),
+            "permno": list(range(10)),
+            "prc": [2, 6, 7, 8, 9, 3, 6, 7, 8, 9],
+            "me": [1, 2, 3, 4, 100, 1, 2, 3, 4, 100],
+            "exchcd": [1, 1, 1, 2, 3] * 2,
+        }
+    )
+    filtered, report = apply_universe_filters(
+        frame,
+        "date",
+        enabled=True,
+        min_abs_price=5.0,
+        exclude_bottom_market_cap_fraction=0.5,
+        breakpoint_exchange_col="exchcd",
+        breakpoint_exchange_values=[1],
+    )
+    assert filtered["prc"].abs().min() >= 5.0
+    assert filtered.groupby("date")["me"].min().min() >= 2.5
+    assert report["n_rows_dropped"] > 0

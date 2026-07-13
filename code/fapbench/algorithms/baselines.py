@@ -28,6 +28,7 @@ def train_centralized(
     logger: logging.Logger | None = None,
     epoch_log_interval: int = 1,
     log_name: str = "centralized",
+    epoch_end_callback: Callable[[nn.Module, int, float], None] | None = None,
 ) -> nn.Module:
     device_obj = torch.device(device)
     initial = model_fn().to(device_obj)
@@ -47,6 +48,7 @@ def train_centralized(
         logger=logger,
         log_prefix=log_name,
         epoch_log_interval=epoch_log_interval,
+        epoch_end_callback=epoch_end_callback,
     )
     return model
 
@@ -68,6 +70,7 @@ def train_local_models(
     logger: logging.Logger | None = None,
     client_log_interval: int = 1,
     epoch_log_interval: int = 0,
+    epoch_end_callbacks: Mapping[str, Callable[[nn.Module, int, float], None]] | None = None,
 ) -> dict[str, nn.Module]:
     device_obj = torch.device(device)
     result: dict[str, nn.Module] = {}
@@ -125,6 +128,11 @@ def train_local_models(
             logger=logger if epoch_log_interval > 0 else None,
             log_prefix=f"local client={client_id}",
             epoch_log_interval=epoch_log_interval,
+            epoch_end_callback=(
+                None
+                if epoch_end_callbacks is None
+                else epoch_end_callbacks.get(client_id)
+            ),
         )
         result[client_id] = model
         if should_log_client:

@@ -1,0 +1,69 @@
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/crsp_compustat_profitability_grid
+continue_on_error: true
+seeds: [11, 22, 33, 44, 55]
+
+scenarios:
+  - name: ff12_full_participation
+    overrides:
+      partition:
+        type: domain
+        domain_col: sic
+        transform: ff12
+        output_col: ff12
+        drop_missing_domain: true
+        persistent_entity: false
+      federated:
+        participation_rate: 1.0
+        local_epochs: 1
+
+  - name: ff12_half_participation
+    overrides:
+      partition:
+        type: domain
+        domain_col: sic
+        transform: ff12
+        output_col: ff12
+        drop_missing_domain: true
+        persistent_entity: false
+      federated:
+        participation_rate: 0.5
+        local_epochs: 1
+
+  - name: ff12_more_local_steps
+    overrides:
+      partition:
+        type: domain
+        domain_col: sic
+        transform: ff12
+        output_col: ff12
+        drop_missing_domain: true
+        persistent_entity: false
+      federated:
+        participation_rate: 1.0
+        local_epochs: 5
+
+  - name: ff12_price_above_5
+    overrides:
+      universe_filter:
+        enabled: true
+        price_col: prc
+        min_abs_price: 5.0
+        exclude_bottom_market_cap_fraction: 0.0
+      federated:
+        participation_rate: 1.0
+        local_epochs: 1
+
+  - name: ff12_exclude_microcaps
+    overrides:
+      universe_filter:
+        enabled: true
+        price_col: prc
+        min_abs_price: 5.0
+        market_cap_col: me
+        exclude_bottom_market_cap_fraction: 0.2
+        breakpoint_exchange_col: exchcd
+        breakpoint_exchange_values: [1]
+      federated:
+        participation_rate: 1.0
+        local_epochs: 1

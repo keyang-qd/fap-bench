@@ -192,6 +192,7 @@ class FederatedTrainer:
         self,
         train_frame: pd.DataFrame,
         feature_masks: Mapping[str, object] | None = None,
+        round_end_callback: Callable[[nn.Module, int, float], None] | None = None,
     ) -> nn.Module:
         client_ids = sorted(train_frame[self.client_col].astype(str).unique().tolist())
         if len(client_ids) < 2:
@@ -355,6 +356,8 @@ class FederatedTrainer:
                 cumulative_communicated_parameters=int(cumulative_communicated),
                 elapsed_seconds=float(round_elapsed),
             )
+            if round_end_callback is not None:
+                round_end_callback(self.global_model, round_number, mean_loss)
             if self._should_log_round(round_number):
                 self.logger.info(
                     "%s | round=%s/%s | done | mean_train_loss=%.8f | "

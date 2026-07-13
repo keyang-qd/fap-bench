@@ -37,6 +37,7 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
         raise ValueError("The grid config must contain at least one scenario.")
 
     total_runs = len(scenarios) * len(seeds)
+    continue_on_error = bool(grid_config.get("continue_on_error", True))
     logger.info(
         "Grid start | scenarios=%s | seeds=%s | total_runs=%s | output=%s",
         len(scenarios),
@@ -72,39 +73,79 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
                     name,
                     seed,
                 )
-                output = run(config)
-
-                results = pd.read_csv(output / "benchmark_results.csv")
-                results.insert(0, "seed", seed)
-                results.insert(0, "scenario", name)
-                heterogeneity = pd.read_json(
-                    output / "heterogeneity.json", typ="series"
-                ).to_dict()
-                for key, value in heterogeneity.items():
-                    if isinstance(value, (int, float)):
-                        results[f"heterogeneity_{key}"] = value
-                combined_rows.append(results)
-                run_manifest.append(
-                    {"scenario": name, "seed": seed, "output_dir": str(output.resolve())}
-                )
-                logger.info(
-                    "Grid run=%s/%s | scenario=%s | seed=%s | done | methods=%s | elapsed=%s",
-                    run_index,
-                    total_runs,
-                    name,
-                    seed,
-                    len(results),
-                    format_seconds(time.perf_counter() - run_started),
-                )
+                try:
+                    output = run(config)
+                    results = pd.read_csv(output / "benchmark_results.csv")
+                    results.insert(0, "seed", seed)
+                    results.insert(0, "scenario", name)
+                    heterogeneity = pd.read_json(
+                        output / "heterogeneity.json", typ="series"
+                    ).to_dict()
+                    for key, value in heterogeneity.items():
+                        if isinstance(value, (int, float)):
+                            results[f"heterogeneity_{key}"] = value
+                    combined_rows.append(results)
+                    run_manifest.append(
+                        {
+                            "scenario": name,
+                            "seed": seed,
+                            "status": "completed",
+                            "output_dir": str(output.resolve()),
+                            "elapsed_seconds": float(
+                                time.perf_counter() - run_started
+                            ),
+                        }
+                    )
+                    logger.info(
+                        "Grid run=%s/%s | scenario=%s | seed=%s | done | methods=%s | elapsed=%s",
+                        run_index,
+                        total_runs,
+                        name,
+                        seed,
+                        len(results),
+                        format_seconds(time.perf_counter() - run_started),
+                    )
+                except Exception as exc:
+                    run_manifest.append(
+                        {
+                            "scenario": name,
+                            "seed": seed,
+                            "status": "failed",
+                            "output_dir": str(run_dir.resolve()),
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc),
+                            "elapsed_seconds": float(
+                                time.perf_counter() - run_started
+                            ),
+                        }
+                    )
+                    write_json(run_manifest, grid_output / "run_manifest.json")
+                    logger.exception(
+                        "Grid run=%s/%s | scenario=%s | seed=%s | failed",
+                        run_index,
+                        total_runs,
+                        name,
+                        seed,
+                    )
+                    if not continue_on_error:
+                        raise
+                    continue
 
         with log_stage(logger, "Aggregate grid outputs"):
+            write_json(run_manifest, grid_output / "run_manifest.json")
+            if not combined_rows:
+                raise RuntimeError("Every grid run failed; no results can be aggregated.")
             combined = pd.concat(combined_rows, ignore_index=True)
             combined.to_csv(grid_output / "grid_results.csv", index=False)
 
-            numeric = combined.select_dtypes(include="number").columns.tolist()
+            numeric = [
+                column
+                for column in combined.select_dtypes(include="number").columns
+                if column != "seed"
+            ]
             summary = (
                 combined.groupby(["scenario", "method"], as_index=False)[numeric]
-                .agg(["mean", "std"])
+                .agg(["mean", "std", "count"])
             )
             summary.columns = [
                 "_".join(str(part) for part in column if str(part))
@@ -113,7 +154,6 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
                 for column in summary.columns
             ]
             summary.to_csv(grid_output / "grid_summary.csv", index=False)
-            write_json(run_manifest, grid_output / "run_manifest.json")
 
         logger.info(
             "Grid complete | total_runs=%s | rows=%s | elapsed=%s",

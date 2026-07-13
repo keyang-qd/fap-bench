@@ -492,3 +492,120 @@ class PanelPreprocessor:
             raise ValueError("Training split is empty.")
         self.fit(train)
         return self.transform(frame, date_col=date_col)
+
+
+def apply_universe_filters(
+    frame: pd.DataFrame,
+    date_col: str,
+    *,
+    enabled: bool = False,
+    price_col: str = "prc",
+    min_abs_price: float | None = None,
+    market_cap_col: str = "me",
+    exclude_bottom_market_cap_fraction: float = 0.0,
+    breakpoint_exchange_col: str | None = None,
+    breakpoint_exchange_values: Sequence[object] = (1,),
+    min_stocks_per_month: int = 0,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Apply transparent, formation-date investable-universe robustness filters.
+
+    Market-cap cutoffs are estimated separately within each formation month. When
+    ``breakpoint_exchange_col`` is provided, the quantile is estimated from the
+    configured reference exchange (for example NYSE, ``exchcd == 1``) and then
+    applied to the full cross-section.
+    """
+    report: dict[str, object] = {
+        "enabled": bool(enabled),
+        "n_rows_before": int(len(frame)),
+        "min_abs_price": min_abs_price,
+        "exclude_bottom_market_cap_fraction": float(
+            exclude_bottom_market_cap_fraction
+        ),
+        "min_stocks_per_month": int(min_stocks_per_month),
+    }
+    if not enabled:
+        report["n_rows_after"] = int(len(frame))
+        report["n_rows_dropped"] = 0
+        return frame.copy(), report
+    if date_col not in frame.columns:
+        raise KeyError(f"Universe-filter date column {date_col!r} is absent.")
+
+    data = frame.copy()
+    data[date_col] = pd.to_datetime(data[date_col], errors="coerce")
+    if data[date_col].isna().any():
+        raise ValueError("Universe-filter date column contains invalid dates.")
+
+    filter_counts: dict[str, int] = {}
+    if min_abs_price is not None:
+        if price_col not in data.columns:
+            raise KeyError(
+                f"Price filter requested but price_col={price_col!r} is absent."
+            )
+        price = pd.to_numeric(data[price_col], errors="coerce").abs()
+        keep = price >= float(min_abs_price)
+        filter_counts["price_rows_dropped"] = int((~keep).sum())
+        data = data.loc[keep].copy()
+
+    fraction = float(exclude_bottom_market_cap_fraction)
+    if not 0.0 <= fraction < 1.0:
+        raise ValueError(
+            "exclude_bottom_market_cap_fraction must be in [0, 1)."
+        )
+    if fraction > 0:
+        if market_cap_col not in data.columns:
+            raise KeyError(
+                "Market-cap filter requested but "
+                f"market_cap_col={market_cap_col!r} is absent."
+            )
+        if breakpoint_exchange_col is not None and breakpoint_exchange_col not in data:
+            raise KeyError(
+                "Market-cap reference exchange requested but "
+                f"breakpoint_exchange_col={breakpoint_exchange_col!r} is absent."
+            )
+        market_cap = pd.to_numeric(data[market_cap_col], errors="coerce")
+        keep = pd.Series(False, index=data.index)
+        cutoff_rows: list[dict[str, object]] = []
+        for date, indices in data.groupby(date_col, sort=True).groups.items():
+            month_cap = market_cap.loc[indices]
+            reference_cap = month_cap
+            if breakpoint_exchange_col is not None:
+                exchange = data.loc[indices, breakpoint_exchange_col]
+                reference_mask = exchange.isin(list(breakpoint_exchange_values))
+                candidate = month_cap.loc[reference_mask & month_cap.notna()]
+                if not candidate.empty:
+                    reference_cap = candidate
+            reference_cap = reference_cap.dropna()
+            if reference_cap.empty:
+                continue
+            cutoff = float(reference_cap.quantile(fraction))
+            keep.loc[indices] = month_cap.loc[indices] >= cutoff
+            cutoff_rows.append(
+                {
+                    "date": str(pd.Timestamp(date).date()),
+                    "cutoff": cutoff,
+                    "reference_n": int(len(reference_cap)),
+                }
+            )
+        filter_counts["market_cap_rows_dropped"] = int((~keep).sum())
+        data = data.loc[keep].copy()
+        report["market_cap_cutoffs"] = cutoff_rows
+        report["breakpoint_exchange_col"] = breakpoint_exchange_col
+        report["breakpoint_exchange_values"] = list(breakpoint_exchange_values)
+
+    if min_stocks_per_month > 0:
+        counts = data.groupby(date_col, observed=True).size()
+        valid_dates = counts[counts >= int(min_stocks_per_month)].index
+        keep = data[date_col].isin(valid_dates)
+        filter_counts["sparse_month_rows_dropped"] = int((~keep).sum())
+        report["months_dropped_for_min_stocks"] = int(
+            data.loc[~keep, date_col].nunique()
+        )
+        data = data.loc[keep].copy()
+
+    report.update(filter_counts)
+    report["n_rows_after"] = int(len(data))
+    report["n_rows_dropped"] = int(len(frame) - len(data))
+    report["n_months_after"] = int(data[date_col].nunique())
+    if data.empty:
+        raise ValueError("Universe filters removed every observation.")
+    return data.reset_index(drop=True), report

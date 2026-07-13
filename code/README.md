@@ -120,21 +120,79 @@ python scripts/run_benchmark.py \
 pytest -q
 ```
 
+## Evaluation protocol
+
+The revised protocol separates predictive performance from three portfolio views:
+
+- `global_portfolio_*`: unconstrained pooled ranking across the full universe;
+- `client_neutral_portfolio_*`: portfolios formed within each client and then equal-weighted;
+- `client_portfolio_*`: the distribution of standalone client portfolio outcomes.
+
+For domain heterogeneity, `client_neutral` is the default primary portfolio. The
+unconstrained global portfolio is still saved together with long/short client shares,
+HHI concentration, and maximum client exposure. Local-only models are calibrated by
+monthly within-client percentile ranks before any pooled ranking because their raw
+output locations and scales are not comparable. The uncalibrated local portfolio is
+retained only as an explicitly labelled diagnostic.
+
+The validation split can select the best checkpoint by `rank_ic`, `ic`, `mse`,
+`mae`, or another available predictive metric while preserving a fixed maximum
+training budget. With `match_federated_local_passes: true`, centralized and local
+baselines use the same expected full-dataset-equivalent number of passes as FL,
+including partial participation.
+
 ## Output files
 
+- `run_metadata.json`: run status, environment, dimensions, elapsed time, and errors;
+- `resolved_config.json`: fully resolved benchmark configuration;
 - `source_validation.json`: target alignment, date consistency, universe, and industry checks;
+- `universe_filter.json`: price/microcap filter settings, cutoffs, and dropped rows;
 - `heterogeneity.json`: measured client-size, distribution, feature, and participation heterogeneity;
 - `partition_assignments.parquet`: formation/target dates and training-defined clients;
 - `feature_masks.csv`: client-specific feature availability;
+- `checkpoints/<method>.pt`: selected validation checkpoint for each method;
 - `benchmark_results.csv`: consolidated method comparison;
 - `training_<algorithm>.csv`: per-round loss and communication;
-- `predictions_<method>.parquet`: stock-level out-of-sample predictions;
-- `portfolio_returns_<method>.csv`: long--short returns dated by target realization month;
-- `client_metrics_<method>.csv`: per-client predictive metrics.
+- `validation_history_<method>.csv`: validation metric and selected checkpoint;
+- `predictions_<method>.parquet`: stock-level out-of-sample predictions and calibrated local portfolio score;
+- `monthly_predictive_metrics_<method>.csv`: monthly MSE, IC, RankIC, and prediction dispersion;
+- `portfolio_returns_<method>.csv`: explicitly selected primary portfolio;
+- `portfolio_returns_global_<method>.csv`: unconstrained pooled portfolio;
+- `portfolio_returns_client_neutral_<method>.csv`: equal-weighted within-client portfolio;
+- `portfolio_client_exposures_<method>.csv`: monthly long/short client composition;
+- `client_metrics_<method>.csv`: per-client predictive metrics;
+- `client_portfolio_metrics_<method>.csv`: standalone client economic metrics.
+
+## Multi-seed and robustness runs
+
+The production grid contains five seeds, partial participation, additional local
+steps, a $5 price screen, and a NYSE-breakpoint microcap exclusion:
+
+```bash
+python scripts/run_grid.py \
+  --grid configs/crsp_compustat_profitability_grid.yaml
+```
+
+Failed grid cells are recorded in `run_manifest.json` and do not discard completed
+runs when `continue_on_error: true`.
+
+After a run, compute paired Newey--West return tests and moving-block-bootstrap
+Sharpe confidence intervals with:
+
+```bash
+python scripts/analyze_results.py \
+  --output-dir outputs/crsp_compustat_profitability \
+  --variant primary \
+  --bootstrap 2000
+```
 
 ## Remaining publication work
 
-The code is an experimental benchmark implementation, not the finished empirical study. Before submission, select all hyperparameters using the validation period, run multiple seeds and rolling windows, verify the SCAFFOLD/FedAdam results against an established FL library on at least one setting, and document stock-price, microcap, liquidity, and transaction-cost filters.
+The code is an experimental benchmark implementation, not the finished empirical
+study. Before submission, run the full multi-seed grid and rolling windows, verify
+SCAFFOLD and FedAdam against an established FL library on at least one setting, add
+liquidity and value-weighted portfolio robustness checks, and document the exact
+security-universe construction used in every table.
 
 ## Runtime logging
 

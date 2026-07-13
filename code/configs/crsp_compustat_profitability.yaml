@@ -32,12 +32,25 @@ split:
   train_end: 2014-12-31
   val_end: 2018-12-31
 
+universe_filter:
+  # Keep disabled in the primary specification; enable in robustness runs.
+  enabled: false
+  price_col: prc
+  min_abs_price: null
+  market_cap_col: me
+  exclude_bottom_market_cap_fraction: 0.0
+  # Use NYSE breakpoints by setting this to exchcd and values to [1].
+  breakpoint_exchange_col: null
+  breakpoint_exchange_values: [1]
+  min_stocks_per_month: 0
+
 partition:
   type: domain
   domain_col: sic
   transform: ff12
   output_col: ff12
   drop_missing_domain: true
+  missing_domain_label: MissingSIC
   persistent_entity: false
 
 feature_heterogeneity:
@@ -54,7 +67,16 @@ baselines:
   centralized: true
   centralized_masked: true
   local: true
-  epochs: 10
+  # Match the number of local data passes used by FL (rounds × local_epochs).
+  match_federated_local_passes: true
+  epochs: null
+
+model_selection:
+  enabled: true
+  # Select the test checkpoint using only the validation period.
+  metric: rank_ic
+  mode: max
+  evaluate_every: 5
 
 federated:
   algorithms: [fedavg, fedprox, scaffold, fedadam]
@@ -74,9 +96,16 @@ federated:
 
 evaluation:
   date_col: target_date
+  client_col: client_id
   portfolio_quantile: 0.1
   transaction_cost_bps: 10
   periods_per_year: 12
+  # Domain benchmarks use equal-weighted within-client portfolios as the main
+  # economic result. The unconstrained pooled portfolio is still reported.
+  primary_portfolio: client_neutral
+  # Local models have incomparable raw score scales across clients.
+  local_global_score_calibration: percentile
+  report_uncalibrated_local_global: true
 
 logging:
   level: INFO
