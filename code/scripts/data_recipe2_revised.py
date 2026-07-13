@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 import numpy as np
 import pandas as pd
@@ -18,6 +21,88 @@ PROFITABILITY_COMPONENTS = [
     "gmar",
     "fcfoa",
 ]
+
+
+LOGGER_NAME = "data_recipe"
+
+
+def _configure_logger(
+    log_level: str | int = "INFO",
+    log_file: str | os.PathLike[str] | None = None,
+) -> logging.Logger:
+    """Create a terminal logger and, optionally, a persistent file logger."""
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.setLevel(log_level)
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # Rebuild handlers on each top-level run so repeated notebook calls do not
+    # duplicate messages or keep writing to a stale log file.
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    if log_file is not None:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        logger.info("Persistent log file: %s", log_path)
+
+    return logger
+
+
+def _frame_memory_mb(df: pd.DataFrame) -> float:
+    return float(df.memory_usage(index=True, deep=True).sum() / (1024 ** 2))
+
+
+def _log_frame(logger: logging.Logger, name: str, df: pd.DataFrame) -> None:
+    logger.info(
+        "%s | rows=%s | cols=%s | memory=%.1f MB",
+        name,
+        f"{len(df):,}",
+        f"{df.shape[1]:,}",
+        _frame_memory_mb(df),
+    )
+
+
+@contextmanager
+def _log_stage(logger: logging.Logger, name: str) -> Iterator[None]:
+    """Log stage start, completion time, and failures without changing logic."""
+    started = time.perf_counter()
+    logger.info("START | %s", name)
+    try:
+        yield
+    except Exception:
+        logger.exception("FAILED | %s | elapsed=%.2fs", name, time.perf_counter() - started)
+        raise
+    else:
+        logger.info("DONE  | %s | elapsed=%.2fs", name, time.perf_counter() - started)
+
+
+def _read_csv_with_log(path: Path, logger: logging.Logger) -> pd.DataFrame:
+    size_mb = path.stat().st_size / (1024 ** 2) if path.exists() else float("nan")
+    started = time.perf_counter()
+    logger.info("Reading %s | file_size=%.1f MB", path.name, size_mb)
+    frame = pd.read_csv(path, low_memory=False)
+    logger.info(
+        "Loaded %s | rows=%s | cols=%s | memory=%.1f MB | elapsed=%.2fs",
+        path.name,
+        f"{len(frame):,}",
+        f"{frame.shape[1]:,}",
+        _frame_memory_mb(frame),
+        time.perf_counter() - started,
+    )
+    return frame
 
 
 def _require_columns(df: pd.DataFrame, columns: Iterable[str], name: str) -> None:
@@ -93,6 +178,8 @@ def data_recipe2(
     formation_end: str = "2023-12",
     accounting_start: str = "1963-01",
     accounting_end: str = "2024-12",
+    log_level: str | int = "INFO",
+    log_file: str | os.PathLike[str] | None = None,
 ) -> pd.DataFrame:
     """Build a monthly CRSP--Compustat profitability panel.
 
@@ -100,12 +187,26 @@ def data_recipe2(
     delisting-adjusted return in ``retadj_1mn``. Market variables and returns are
     never forward-filled.
     """
+    total_started = time.perf_counter()
+    logger = _configure_logger(log_level=log_level, log_file=log_file)
     input_path = Path(input_path)
 
-    comp = pd.read_csv(input_path / "compustat.csv", low_memory=False)
-    ccm = pd.read_csv(input_path / "ccm.csv", low_memory=False)
-    crsp_m = pd.read_csv(input_path / "crsp.csv", low_memory=False)
-    dlret = pd.read_csv(input_path / "delisting.csv", low_memory=False)
+    logger.info(
+        "Building CRSP--Compustat panel | input=%s | output=%s | "
+        "formation=%s..%s | accounting=%s..%s",
+        input_path,
+        output_path,
+        formation_start,
+        formation_end,
+        accounting_start,
+        accounting_end,
+    )
+
+    with _log_stage(logger, "Load source CSV files"):
+        comp = _read_csv_with_log(input_path / "compustat.csv", logger)
+        ccm = _read_csv_with_log(input_path / "ccm.csv", logger)
+        crsp_m = _read_csv_with_log(input_path / "crsp.csv", logger)
+        dlret = _read_csv_with_log(input_path / "delisting.csv", logger)
 
     # ------------------------------------------------------------------
     # Compustat annual fundamentals
@@ -127,12 +228,19 @@ def data_recipe2(
         "ccm.csv",
     )
 
+    comp_before_filter = len(comp)
     comp = comp.loc[
         (comp["indfmt"] == "INDL")
         & (comp["datafmt"] == "STD")
         & (comp["popsrc"] == "D")
         & (comp["consol"] == "C")
     ].copy()
+    logger.info(
+        "Compustat format filter | kept=%s/%s (%.1f%%)",
+        f"{len(comp):,}",
+        f"{comp_before_filter:,}",
+        100.0 * len(comp) / max(comp_before_filter, 1),
+    )
 
     comp["gvkey"] = pd.to_numeric(comp["gvkey"], errors="coerce").astype("Int64")
     ccm["gvkey"] = pd.to_numeric(ccm["gvkey"], errors="coerce").astype("Int64")
@@ -158,7 +266,10 @@ def data_recipe2(
         + pd.offsets.MonthEnd(6)
     ).dt.to_period("M")
 
-    comp_m = comp.merge(ccm, on="gvkey", how="inner", validate="many_to_many")
+    with _log_stage(logger, "Merge Compustat with CCM links"):
+        comp_m = comp.merge(ccm, on="gvkey", how="inner", validate="many_to_many")
+    _log_frame(logger, "Compustat--CCM raw merge", comp_m)
+    linked_before = len(comp_m)
     comp_m = comp_m.loc[
         (comp_m["datadate"] >= comp_m["linkdt"])
         & (
@@ -166,6 +277,11 @@ def data_recipe2(
             | (comp_m["datadate"] <= comp_m["linkenddt"])
         )
     ].copy()
+    logger.info(
+        "CCM validity-window filter | kept=%s/%s",
+        f"{len(comp_m):,}",
+        f"{linked_before:,}",
+    )
 
     # Prefer primary links deterministically before removing duplicate permno-dates.
     comp_m["_linkprim_order"] = comp_m["linkprim"].map({"P": 0, "C": 1}).fillna(9)
@@ -257,14 +373,23 @@ def data_recipe2(
     ].copy()
 
     # Impute annual profitability ratios only; identifiers and dates are untouched.
-    comp_m_final[PROFITABILITY_COMPONENTS] = (
-        comp_m_final.groupby(["year_month", "sic2"], observed=True)[PROFITABILITY_COMPONENTS]
-        .transform(lambda values: values.fillna(values.median()))
+    with _log_stage(logger, "Impute annual profitability ratios"):
+        missing_before = comp_m_final[PROFITABILITY_COMPONENTS].isna().mean().mean()
+        comp_m_final[PROFITABILITY_COMPONENTS] = (
+            comp_m_final.groupby(["year_month", "sic2"], observed=True)[PROFITABILITY_COMPONENTS]
+            .transform(lambda values: values.fillna(values.median()))
+        )
+        comp_m_final[PROFITABILITY_COMPONENTS] = (
+            comp_m_final.groupby("year_month", observed=True)[PROFITABILITY_COMPONENTS]
+            .transform(lambda values: values.fillna(values.median()))
+        )
+        missing_after = comp_m_final[PROFITABILITY_COMPONENTS].isna().mean().mean()
+    logger.info(
+        "Annual profitability missing rate | before=%.2f%% | after=%.2f%%",
+        100.0 * missing_before,
+        100.0 * missing_after,
     )
-    comp_m_final[PROFITABILITY_COMPONENTS] = (
-        comp_m_final.groupby("year_month", observed=True)[PROFITABILITY_COMPONENTS]
-        .transform(lambda values: values.fillna(values.median()))
-    )
+    _log_frame(logger, "Annual Compustat panel", comp_m_final)
 
     # ------------------------------------------------------------------
     # CRSP monthly returns and market data
@@ -299,11 +424,17 @@ def data_recipe2(
         .drop_duplicates(["permno", "year_month"], keep="last")
     )
 
-    crsp = crsp_m.merge(
-        dlret[["permno", "year_month", "dlret", "dlstdt"]],
-        on=["permno", "year_month"],
-        how="left",
-        validate="many_to_one",
+    with _log_stage(logger, "Merge CRSP with delisting returns"):
+        crsp = crsp_m.merge(
+            dlret[["permno", "year_month", "dlret", "dlstdt"]],
+            on=["permno", "year_month"],
+            how="left",
+            validate="many_to_one",
+        )
+    logger.info(
+        "Delisting coverage | rows_with_dlret=%s | both_ret_and_dlret=%s",
+        f"{crsp['dlret'].notna().sum():,}",
+        f"{(crsp['ret'].notna() & crsp['dlret'].notna()).sum():,}",
     )
 
     # Combine ordinary and delisting returns when both are observed.
@@ -316,10 +447,17 @@ def data_recipe2(
     )
 
     # Keep only ordinary common shares on NYSE/AMEX/Nasdaq. No market variable is ffilled.
+    crsp_before_filter = len(crsp)
     crsp = crsp.loc[
         crsp["shrcd"].isin([10, 11])
         & crsp["exchcd"].isin([1, 2, 3])
     ].copy()
+    logger.info(
+        "CRSP common-share/exchange filter | kept=%s/%s (%.1f%%)",
+        f"{len(crsp):,}",
+        f"{crsp_before_filter:,}",
+        100.0 * len(crsp) / max(crsp_before_filter, 1),
+    )
     crsp = (
         crsp.sort_values(["permno", "year_month", "date"])
         .drop_duplicates(["permno", "year_month"], keep="last")
@@ -333,31 +471,34 @@ def data_recipe2(
     crsp["me_security"] = crsp["me_security"] / 1000.0
 
     # Assign company-level market equity to the largest security for each permco-month.
-    company_me = (
-        crsp.groupby(["year_month", "permco"], observed=True)["me_security"]
-        .sum(min_count=1)
-        .rename("me")
-        .reset_index()
-    )
-    representative_rows = (
-        crsp.sort_values(
-            ["year_month", "permco", "me_security", "permno"],
-            ascending=[True, True, False, True],
+    with _log_stage(logger, "Aggregate company market equity and choose representative securities"):
+        company_me = (
+            crsp.groupby(["year_month", "permco"], observed=True)["me_security"]
+            .sum(min_count=1)
+            .rename("me")
+            .reset_index()
         )
-        .drop_duplicates(["year_month", "permco"], keep="first")
-    )
-    crsp2 = representative_rows.merge(
-        company_me,
-        on=["year_month", "permco"],
-        how="left",
-        validate="one_to_one",
-    )
+        representative_rows = (
+            crsp.sort_values(
+                ["year_month", "permco", "me_security", "permno"],
+                ascending=[True, True, False, True],
+            )
+            .drop_duplicates(["year_month", "permco"], keep="first")
+        )
+        crsp2 = representative_rows.merge(
+            company_me,
+            on=["year_month", "permco"],
+            how="left",
+            validate="one_to_one",
+        )
+    _log_frame(logger, "Representative-security CRSP panel", crsp2)
 
     crsp2 = crsp2.sort_values(["permno", "year_month"])
     crsp2 = crsp2.drop_duplicates(["permno", "year_month"], keep="last")
 
     # Exact calendar-month lag; a two-month gap is not treated as a one-month lag.
-    crsp2 = _exact_month_lag(crsp2, ["me"], lag_months=1, suffix="_lag")
+    with _log_stage(logger, "Attach exact one-month market-equity lag"):
+        crsp2 = _exact_month_lag(crsp2, ["me"], lag_months=1, suffix="_lag")
     crsp2["port_weight"] = crsp2["me_lag"]
     fallback_weight = crsp2["me"] / (1.0 + crsp2["retx"])
     crsp2["port_weight"] = crsp2["port_weight"].combine_first(fallback_weight)
@@ -373,23 +514,26 @@ def data_recipe2(
     # ------------------------------------------------------------------
     # Monthly panel: forward-fill fundamentals only
     # ------------------------------------------------------------------
-    df = crsp2.merge(
-        comp_m_final,
-        on=["year_month", "permno"],
-        how="left",
-        suffixes=("", "_comp"),
-        validate="one_to_one",
-    )
-    df = df.sort_values(["permno", "year_month"]).copy()
+    with _log_stage(logger, "Merge monthly CRSP panel with Compustat fundamentals"):
+        df = crsp2.merge(
+            comp_m_final,
+            on=["year_month", "permno"],
+            how="left",
+            suffixes=("", "_comp"),
+            validate="one_to_one",
+        )
+        df = df.sort_values(["permno", "year_month"]).copy()
+    _log_frame(logger, "CRSP--Compustat monthly merge", df)
 
     fundamental_columns = [
         column
         for column in compustat_columns
         if column not in {"permno", "permco", "year_month"}
     ]
-    df[fundamental_columns] = (
-        df.groupby("permno", observed=True)[fundamental_columns].ffill()
-    )
+    with _log_stage(logger, "Forward-fill fundamentals within PERMNO"):
+        df[fundamental_columns] = (
+            df.groupby("permno", observed=True)[fundamental_columns].ffill()
+        )
 
     # Prefer CRSP permco; use linked Compustat permco only when CRSP is unavailable.
     if "permco_comp" in df.columns:
@@ -404,33 +548,73 @@ def data_recipe2(
         *PROFITABILITY_COMPONENTS,
         "ib", "at", "gp", "be", "fcf", "oiadp", "ic", "sale", "op",
     ]
-    df[raw_profitability_and_scale] = (
-        df.groupby(["year_month", "sic2"], observed=True)[raw_profitability_and_scale]
-        .transform(lambda values: values.fillna(values.median()))
-    )
-    df[raw_profitability_and_scale] = (
-        df.groupby("year_month", observed=True)[raw_profitability_and_scale]
-        .transform(lambda values: values.fillna(values.median()))
+    with _log_stage(logger, "Impute monthly profitability and scale variables"):
+        monthly_missing_before = df[raw_profitability_and_scale].isna().mean().mean()
+        df[raw_profitability_and_scale] = (
+            df.groupby(["year_month", "sic2"], observed=True)[raw_profitability_and_scale]
+            .transform(lambda values: values.fillna(values.median()))
+        )
+        df[raw_profitability_and_scale] = (
+            df.groupby("year_month", observed=True)[raw_profitability_and_scale]
+            .transform(lambda values: values.fillna(values.median()))
+        )
+        monthly_missing_after = df[raw_profitability_and_scale].isna().mean().mean()
+    logger.info(
+        "Monthly model-input missing rate | before=%.2f%% | after=%.2f%%",
+        100.0 * monthly_missing_before,
+        100.0 * monthly_missing_after,
     )
 
     # Construct monthly cross-sectional rank z-scores after monthly imputation.
-    for feature in PROFITABILITY_COMPONENTS:
-        df[f"{feature}_rank"] = df.groupby("year_month", observed=True)[feature].rank(method="average")
-        df[f"{feature}_zscore"] = (
-            df.groupby("year_month", observed=True)[feature]
-            .transform(_cross_sectional_rank_zscore)
-        )
+    with _log_stage(logger, "Construct monthly cross-sectional rank z-scores"):
+        for index, feature in enumerate(PROFITABILITY_COMPONENTS, start=1):
+            feature_started = time.perf_counter()
+            logger.info(
+                "Z-score progress | %s/%s | feature=%s",
+                index,
+                len(PROFITABILITY_COMPONENTS),
+                feature,
+            )
+            df[f"{feature}_rank"] = df.groupby("year_month", observed=True)[feature].rank(method="average")
+            df[f"{feature}_zscore"] = (
+                df.groupby("year_month", observed=True)[feature]
+                .transform(_cross_sectional_rank_zscore)
+            )
+            nonmissing_zscore = int(df[f"{feature}_zscore"].notna().sum())
+            log_method = logger.info if nonmissing_zscore > 0 else logger.warning
+            log_method(
+                "Z-score complete | feature=%s | nonmissing=%s | elapsed=%.2fs",
+                feature,
+                f"{nonmissing_zscore:,}",
+                time.perf_counter() - feature_started,
+            )
 
     zscore_columns = [f"{feature}_zscore" for feature in PROFITABILITY_COMPONENTS]
     df["profitability_simple"] = df[zscore_columns].mean(axis=1, skipna=False)
 
     df["shares"] = df["shrout"] * df["cfacshr"]
-    df = _exact_month_lag(df, ["shares"], lag_months=1, suffix="_last")
+    with _log_stage(logger, "Attach exact one-month share-count lag"):
+        df = _exact_month_lag(df, ["shares"], lag_months=1, suffix="_last")
     df["shares_chg"] = df["shares"] / df["shares_last"]
 
     # Formation sample uses month-t information; target is realized in month t+1.
+    before_formation_filter = len(df)
     df = df.loc[df["year_month"].between(formation_start, formation_end)].copy()
-    df = _merge_next_month_target(df, monthly_target_returns)
+    logger.info(
+        "Formation-period filter | kept=%s/%s",
+        f"{len(df):,}",
+        f"{before_formation_filter:,}",
+    )
+    with _log_stage(logger, "Attach exact next-month return targets"):
+        df = _merge_next_month_target(df, monthly_target_returns)
+    target_coverage = float(df["retadj_1mn"].notna().mean()) if len(df) else 0.0
+    target_log_method = logger.info if target_coverage >= 0.5 else logger.warning
+    target_log_method(
+        "Next-month target coverage | nonmissing=%s/%s (%.1f%%)",
+        f"{df['retadj_1mn'].notna().sum():,}",
+        f"{len(df):,}",
+        100.0 * target_coverage,
+    )
 
     # Keep formation return separately and do not overwrite/fill it.
     df["formation_date"] = df["year_month"].dt.to_timestamp(how="end").dt.normalize()
@@ -452,11 +636,25 @@ def data_recipe2(
 
     # Some source extracts may omit nonessential accounting fields.
     final_columns = [column for column in final_columns if column in df.columns]
-    df = df[final_columns].replace([np.inf, -np.inf], np.nan)
+    with _log_stage(logger, "Select and clean final output columns"):
+        df = df[final_columns].replace([np.inf, -np.inf], np.nan)
 
     required_model_columns = [*zscore_columns, "profitability_simple", "retadj_1mn"]
+    before_required_drop = len(df)
     df = df.dropna(subset=required_model_columns)
     df = df.sort_values(["target_year_month", "permno"]).reset_index(drop=True)
+    logger.info(
+        "Required-model-field filter | kept=%s/%s (%.1f%%)",
+        f"{len(df):,}",
+        f"{before_required_drop:,}",
+        100.0 * len(df) / max(before_required_drop, 1),
+    )
+    _log_frame(logger, "Final modeling panel", df)
+    if df.empty:
+        logger.warning(
+            "Final modeling panel is empty. Check source coverage, formation dates, "
+            "and cross-sectional feature variation."
+        )
 
     duplicate_count = int(df.duplicated(["permno", "year_month"]).sum())
     if duplicate_count:
@@ -465,20 +663,34 @@ def data_recipe2(
     if output_path is not None:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        if output_path.suffix.lower() == ".parquet":
-            df.to_parquet(output_path, index=False)
-        elif output_path.suffix.lower() == ".csv":
-            df.to_csv(output_path, index=False)
-        else:
-            raise ValueError("output_path must end in .parquet or .csv")
+        with _log_stage(logger, f"Write output file: {output_path.name}"):
+            if output_path.suffix.lower() == ".parquet":
+                df.to_parquet(output_path, index=False)
+            elif output_path.suffix.lower() == ".csv":
+                df.to_csv(output_path, index=False)
+            else:
+                raise ValueError("output_path must end in .parquet or .csv")
+        logger.info(
+            "Output written | path=%s | file_size=%.1f MB",
+            output_path,
+            output_path.stat().st_size / (1024 ** 2),
+        )
 
+    logger.info(
+        "COMPLETE | rows=%s | columns=%s | total_elapsed=%.2fs",
+        f"{len(df):,}",
+        f"{df.shape[1]:,}",
+        time.perf_counter() - total_started,
+    )
     return df
 
 
 if __name__ == "__main__":
     panel = data_recipe2(
         input_path="/Users/keyang/qdata",
-        output_path="/Users/keyang/qdata/profitability_panel_revised.parquet",
+        output_path="/Users/keyang/qdata/data0712.parquet",
+        log_file="/Users/keyang/qdata/data0712_build.log",
+        log_level="INFO",
     )
     print(panel.shape)
     print(panel[["permno", "year_month", "target_year_month", "retadj_1mn"]].head())

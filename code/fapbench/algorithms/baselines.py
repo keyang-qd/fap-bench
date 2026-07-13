@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -8,6 +10,7 @@ import torch
 from torch import nn
 
 from fapbench.algorithms.common import make_loader, train_one_client
+from fapbench.utils import format_seconds
 
 
 def train_centralized(
@@ -22,6 +25,9 @@ def train_centralized(
     device: str = "cpu",
     optimizer_name: str = "sgd",
     momentum: float = 0.0,
+    logger: logging.Logger | None = None,
+    epoch_log_interval: int = 1,
+    log_name: str = "centralized",
 ) -> nn.Module:
     device_obj = torch.device(device)
     initial = model_fn().to(device_obj)
@@ -38,6 +44,9 @@ def train_centralized(
         weight_decay=weight_decay,
         optimizer_name=optimizer_name,
         momentum=momentum,
+        logger=logger,
+        log_prefix=log_name,
+        epoch_log_interval=epoch_log_interval,
     )
     return model
 
@@ -56,13 +65,45 @@ def train_local_models(
     device: str = "cpu",
     optimizer_name: str = "sgd",
     momentum: float = 0.0,
+    logger: logging.Logger | None = None,
+    client_log_interval: int = 1,
+    epoch_log_interval: int = 0,
 ) -> dict[str, nn.Module]:
     device_obj = torch.device(device)
     result: dict[str, nn.Module] = {}
     shared_initial = model_fn().to(device_obj).state_dict()
-    for client_id, client_frame in train_frame.groupby(client_col, sort=True):
+    groups = list(train_frame.groupby(client_col, sort=True))
+    total_clients = len(groups)
+    started = time.perf_counter()
+    if logger is not None:
+        logger.info(
+            "local | start | clients=%s | rows=%s | epochs_per_client=%s | device=%s",
+            total_clients,
+            f"{len(train_frame):,}",
+            epochs,
+            device_obj,
+        )
+
+    for client_index, (client_id, client_frame) in enumerate(groups, start=1):
         client_id = str(client_id)
         mask = None if feature_masks is None else feature_masks.get(client_id)
+        should_log_client = (
+            logger is not None
+            and client_log_interval > 0
+            and (
+                client_index == 1
+                or client_index == total_clients
+                or client_index % client_log_interval == 0
+            )
+        )
+        if should_log_client:
+            logger.info(
+                "local | client=%s/%s | client_id=%s | rows=%s | start",
+                client_index,
+                total_clients,
+                client_id,
+                f"{len(client_frame):,}",
+            )
         loader = make_loader(
             client_frame,
             feature_columns,
@@ -71,7 +112,7 @@ def train_local_models(
             shuffle=True,
             mask=mask,
         )
-        model, _ = train_one_client(
+        model, loss = train_one_client(
             model_fn,
             shared_initial,
             loader,
@@ -81,6 +122,24 @@ def train_local_models(
             weight_decay=weight_decay,
             optimizer_name=optimizer_name,
             momentum=momentum,
+            logger=logger if epoch_log_interval > 0 else None,
+            log_prefix=f"local client={client_id}",
+            epoch_log_interval=epoch_log_interval,
         )
         result[client_id] = model
+        if should_log_client:
+            logger.info(
+                "local | client=%s/%s | client_id=%s | done | mean_loss=%.8f",
+                client_index,
+                total_clients,
+                client_id,
+                loss,
+            )
+
+    if logger is not None:
+        logger.info(
+            "local | done | trained_clients=%s | elapsed=%s",
+            len(result),
+            format_seconds(time.perf_counter() - started),
+        )
     return result

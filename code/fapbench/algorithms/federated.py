@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import logging
+import time
 from collections import OrderedDict
-from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
@@ -16,6 +17,7 @@ from fapbench.algorithms.common import (
     weighted_average_states,
 )
 from fapbench.partition.temporal import ClientSampler
+from fapbench.utils import format_seconds
 
 
 @dataclass
@@ -56,6 +58,11 @@ class FederatedTrainer:
         server_tau: float = 1e-8,
         client_optimizer: str = "sgd",
         client_momentum: float = 0.0,
+        logger: logging.Logger | None = None,
+        round_log_interval: int = 1,
+        log_client_details: bool = False,
+        client_log_interval: int = 1,
+        local_epoch_log_interval: int = 0,
     ) -> None:
         algorithm = algorithm.lower()
         if algorithm not in self.SUPPORTED:
@@ -80,6 +87,11 @@ class FederatedTrainer:
         self.server_tau = server_tau
         self.client_optimizer = client_optimizer.lower()
         self.client_momentum = client_momentum
+        self.logger = logger
+        self.round_log_interval = max(0, int(round_log_interval))
+        self.log_client_details = bool(log_client_details)
+        self.client_log_interval = max(1, int(client_log_interval))
+        self.local_epoch_log_interval = max(0, int(local_epoch_log_interval))
         if self.client_optimizer not in {"sgd", "adam"}:
             raise ValueError("client_optimizer must be sgd or adam.")
         if self.algorithm == "scaffold" and self.client_optimizer != "sgd":
@@ -149,7 +161,6 @@ class FederatedTrainer:
             if not torch.is_floating_point(global_tensor):
                 result[key] = global_tensor.detach().clone()
                 continue
-            # Pseudo-gradient points from averaged client model toward server model.
             gradient = global_tensor - averaged_local[key]
             self.server_m[key] = (
                 self.server_beta1 * self.server_m[key]
@@ -166,6 +177,17 @@ class FederatedTrainer:
             )
         return result
 
+    def _should_log_round(self, round_number: int) -> bool:
+        return (
+            self.logger is not None
+            and self.round_log_interval > 0
+            and (
+                round_number == 1
+                or round_number == self.rounds
+                or round_number % self.round_log_interval == 0
+            )
+        )
+
     def fit(
         self,
         train_frame: pd.DataFrame,
@@ -178,19 +200,79 @@ class FederatedTrainer:
         if self.algorithm == "scaffold":
             self._initialize_scaffold(client_ids)
 
+        parameter_count = sum(
+            parameter.numel() for parameter in self.global_model.parameters()
+        )
+        total_started = time.perf_counter()
+        cumulative_communicated = 0
+        if self.logger is not None:
+            client_sizes = train_frame.groupby(self.client_col, observed=True).size()
+            self.logger.info(
+                "%s | start | rounds=%s | clients=%s | rows=%s | participation=%.3f | "
+                "local_epochs=%s | batch_size=%s | optimizer=%s | client_lr=%g | "
+                "parameters=%s | device=%s | client_rows_min=%s | client_rows_median=%s | client_rows_max=%s",
+                self.algorithm,
+                self.rounds,
+                len(client_ids),
+                f"{len(train_frame):,}",
+                self.participation_rate,
+                self.local_epochs,
+                self.batch_size,
+                self.client_optimizer,
+                self.client_lr,
+                f"{parameter_count:,}",
+                self.device,
+                f"{int(client_sizes.min()):,}",
+                f"{int(client_sizes.median()):,}",
+                f"{int(client_sizes.max()):,}",
+            )
+
         for round_index in range(self.rounds):
+            round_number = round_index + 1
+            round_started = time.perf_counter()
             selected = sampler.sample(round_index)
+            if self._should_log_round(round_number):
+                self.logger.info(
+                    "%s | round=%s/%s | start | active_clients=%s | selected=%s",
+                    self.algorithm,
+                    round_number,
+                    self.rounds,
+                    len(selected),
+                    ",".join(selected),
+                )
+
             global_state = clone_state_dict(self.global_model)
             local_states: list[Mapping[str, torch.Tensor]] = []
             local_weights: list[float] = []
             local_losses: list[float] = []
             scaffold_deltas: list[OrderedDict[str, torch.Tensor]] = []
 
-            for client_id in selected:
+            for client_index, client_id in enumerate(selected, start=1):
+                client_started = time.perf_counter()
                 client_frame = train_frame.loc[
                     train_frame[self.client_col].astype(str) == client_id
                 ]
                 mask = None if feature_masks is None else feature_masks.get(client_id)
+                should_log_client = (
+                    self.logger is not None
+                    and self.log_client_details
+                    and (
+                        client_index == 1
+                        or client_index == len(selected)
+                        or client_index % self.client_log_interval == 0
+                    )
+                )
+                if should_log_client:
+                    self.logger.info(
+                        "%s | round=%s/%s | client=%s/%s | client_id=%s | rows=%s | start",
+                        self.algorithm,
+                        round_number,
+                        self.rounds,
+                        client_index,
+                        len(selected),
+                        client_id,
+                        f"{len(client_frame):,}",
+                    )
                 loader = make_loader(
                     client_frame,
                     self.feature_columns,
@@ -216,6 +298,9 @@ class FederatedTrainer:
                     ),
                     optimizer_name=self.client_optimizer,
                     momentum=self.client_momentum,
+                    logger=self.logger if self.local_epoch_log_interval > 0 else None,
+                    log_prefix=f"{self.algorithm} round={round_number} client={client_id}",
+                    epoch_log_interval=self.local_epoch_log_interval,
                 )
                 local_states.append(clone_state_dict(local_model))
                 local_weights.append(float(len(client_frame)))
@@ -227,6 +312,19 @@ class FederatedTrainer:
                         self._update_scaffold_controls(
                             client_id, global_state, local_model, steps=steps
                         )
+                    )
+                if should_log_client:
+                    self.logger.info(
+                        "%s | round=%s/%s | client=%s/%s | client_id=%s | done | "
+                        "mean_loss=%.8f | elapsed=%s",
+                        self.algorithm,
+                        round_number,
+                        self.rounds,
+                        client_index,
+                        len(selected),
+                        client_id,
+                        loss,
+                        format_seconds(time.perf_counter() - client_started),
                     )
 
             averaged_local = weighted_average_states(local_states, local_weights)
@@ -243,20 +341,39 @@ class FederatedTrainer:
                     mean_delta = sum(delta[name] for delta in scaffold_deltas) / len(scaffold_deltas)
                     self.server_control[name] = self.server_control[name] + scale * mean_delta
 
-            parameter_count = sum(
-                parameter.numel() for parameter in self.global_model.parameters()
-            )
-            # FedAvg/FedProx/FedAdam communicate one model vector in each
-            # direction. SCAFFOLD additionally exchanges server/client control
-            # variates of the same dimension.
             vectors_per_client = 4 if self.algorithm == "scaffold" else 2
             communicated = vectors_per_client * parameter_count * len(selected)
+            cumulative_communicated += communicated
+            mean_loss = float(sum(local_losses) / len(local_losses))
+            round_elapsed = time.perf_counter() - round_started
             self.history.add(
-                round=round_index + 1,
+                round=round_number,
                 algorithm=self.algorithm,
                 active_clients=len(selected),
-                mean_train_loss=float(sum(local_losses) / len(local_losses)),
+                mean_train_loss=mean_loss,
                 communicated_parameters=int(communicated),
+                cumulative_communicated_parameters=int(cumulative_communicated),
+                elapsed_seconds=float(round_elapsed),
             )
+            if self._should_log_round(round_number):
+                self.logger.info(
+                    "%s | round=%s/%s | done | mean_train_loss=%.8f | "
+                    "communicated_parameters=%s | cumulative=%s | elapsed=%s",
+                    self.algorithm,
+                    round_number,
+                    self.rounds,
+                    mean_loss,
+                    f"{communicated:,}",
+                    f"{cumulative_communicated:,}",
+                    format_seconds(round_elapsed),
+                )
 
+        if self.logger is not None:
+            self.logger.info(
+                "%s | done | rounds=%s | cumulative_communicated_parameters=%s | elapsed=%s",
+                self.algorithm,
+                self.rounds,
+                f"{cumulative_communicated:,}",
+                format_seconds(time.perf_counter() - total_started),
+            )
         return self.global_model

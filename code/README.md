@@ -135,3 +135,30 @@ pytest -q
 ## Remaining publication work
 
 The code is an experimental benchmark implementation, not the finished empirical study. Before submission, select all hyperparameters using the validation period, run multiple seeds and rolling windows, verify the SCAFFOLD/FedAdam results against an established FL library on at least one setting, and document stock-price, microcap, liquidity, and transaction-cost filters.
+
+## Runtime logging
+
+Long-running benchmark stages now log to both the terminal and a persistent file in each output directory. The default file is `run.log`; grid experiments additionally create `grid.log` at the grid root and one `run.log` per scenario/seed.
+
+Recommended production settings:
+
+```yaml
+logging:
+  level: INFO
+  file: run.log
+  console: true
+  epoch_interval: 1
+  local_client_interval: 1
+  prediction_client_interval: 1
+  round_interval: 1
+  federated_client_details: false
+  federated_local_epoch_interval: 0
+```
+
+The log reports data-loading time and memory, split sizes, client sizes, feature masks, heterogeneity calculation, each baseline, every communication round, prediction progress, evaluation metrics, file saving, and total elapsed time. To inspect progress while a run is active:
+
+```bash
+tail -f outputs/crsp_compustat_profitability/run.log
+```
+
+For maximum detail inside each federated round, set `federated_client_details: true`. This can produce thousands of lines for long runs, so it is disabled by default.

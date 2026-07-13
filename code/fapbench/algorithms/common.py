@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import logging
+import time
 from collections import OrderedDict
-from copy import deepcopy
 from typing import Callable, Mapping
 
 import numpy as np
@@ -11,6 +12,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from fapbench.partition.feature import apply_feature_mask
+from fapbench.utils import format_seconds
 
 
 class PanelDataset(Dataset):
@@ -113,6 +115,9 @@ def train_one_client(
     client_control: Mapping[str, torch.Tensor] | None = None,
     optimizer_name: str = "sgd",
     momentum: float = 0.0,
+    logger: logging.Logger | None = None,
+    log_prefix: str = "training",
+    epoch_log_interval: int = 0,
 ) -> tuple[nn.Module, float]:
     model = model_fn().to(device)
     model.load_state_dict(global_state, strict=True)
@@ -139,8 +144,24 @@ def train_one_client(
     }
     total_loss = 0.0
     total_count = 0
+    training_started = time.perf_counter()
 
-    for _ in range(local_epochs):
+    if logger is not None:
+        logger.info(
+            "%s | start | rows=%s | batches=%s | epochs=%s | optimizer=%s | lr=%g | device=%s",
+            log_prefix,
+            f"{len(loader.dataset):,}",
+            f"{len(loader):,}",
+            local_epochs,
+            optimizer_name,
+            learning_rate,
+            device,
+        )
+
+    for epoch_index in range(local_epochs):
+        epoch_started = time.perf_counter()
+        epoch_loss = 0.0
+        epoch_count = 0
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad(set_to_none=True)
@@ -163,7 +184,37 @@ def train_one_client(
                             parameter.grad.add_(correction)
 
             optimizer.step()
-            total_loss += float(loss.detach().cpu()) * len(yb)
+            batch_loss = float(loss.detach().cpu())
+            epoch_loss += batch_loss * len(yb)
+            epoch_count += len(yb)
+            total_loss += batch_loss * len(yb)
             total_count += len(yb)
 
-    return model, total_loss / max(total_count, 1)
+        should_log_epoch = (
+            logger is not None
+            and epoch_log_interval > 0
+            and (
+                (epoch_index + 1) % epoch_log_interval == 0
+                or epoch_index == 0
+                or epoch_index + 1 == local_epochs
+            )
+        )
+        if should_log_epoch:
+            logger.info(
+                "%s | epoch=%s/%s | mean_loss=%.8f | elapsed=%s",
+                log_prefix,
+                epoch_index + 1,
+                local_epochs,
+                epoch_loss / max(epoch_count, 1),
+                format_seconds(time.perf_counter() - epoch_started),
+            )
+
+    mean_loss = total_loss / max(total_count, 1)
+    if logger is not None:
+        logger.info(
+            "%s | done | mean_loss=%.8f | elapsed=%s",
+            log_prefix,
+            mean_loss,
+            format_seconds(time.perf_counter() - training_started),
+        )
+    return model, mean_loss

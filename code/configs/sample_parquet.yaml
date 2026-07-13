@@ -66,3 +66,23 @@ evaluation:
   portfolio_quantile: 0.1
   transaction_cost_bps: 10
   periods_per_year: 12
+
+logging:
+  level: INFO
+  file: run.log
+  console: true
+  overwrite: false
+  # Baselines: log every N epochs. Set 0 to suppress epoch-level logs.
+  epoch_interval: 1
+  # Local-only baseline: log every N clients.
+  local_client_interval: 1
+  # Predictions: log every N clients.
+  prediction_client_interval: 1
+  # Federated training: log every N communication rounds.
+  round_interval: 1
+  # Set true for per-client messages inside every FL round (very verbose).
+  federated_client_details: false
+  federated_client_interval: 1
+  # Set >0 only when local epoch logs inside each FL client are needed.
+  federated_local_epoch_interval: 0
+  local_epoch_interval: 0
