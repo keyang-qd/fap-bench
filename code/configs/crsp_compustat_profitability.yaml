@@ -1,6 +1,17 @@
 seed: 42
 device: cpu
-torch_num_threads: 1
+# Main-process threads used by centralized/local training.
+torch_num_threads: 4
+torch_num_interop_threads: 1
+
+# CPU acceleration. Four spawned workers are a conservative default for an
+# Apple-silicon MacBook Pro; lower to 2 if memory pressure becomes yellow/red.
+performance:
+  cache_client_arrays: true
+  parallel_clients: 4
+  multiprocessing_start_method: spawn
+  worker_torch_threads: 1
+  prediction_batch_size: 65536
 output_dir: outputs/crsp_compustat_profitability
 
 data:

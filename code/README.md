@@ -220,3 +220,9 @@ tail -f outputs/crsp_compustat_profitability/run.log
 ```
 
 For maximum detail inside each federated round, set `federated_client_details: true`. This can produce thousands of lines for long runs, so it is disabled by default.
+
+## Performance acceleration
+
+The current version supports shared-memory multi-process client training and reuses one
+worker pool across all federated algorithms. See [PERFORMANCE.md](PERFORMANCE.md) for
+recommended Apple-silicon settings and guidance for continuing a partial run.

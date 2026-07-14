@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Callable, Mapping
 
 import numpy as np
@@ -27,6 +28,22 @@ class PanelDataset(Dataset):
         return self.x[index], self.y[index]
 
 
+@dataclass(frozen=True)
+class ClientArrays:
+    """Pre-materialized client data reused across communication rounds."""
+
+    x: np.ndarray
+    y: np.ndarray
+
+    @property
+    def n_rows(self) -> int:
+        return int(len(self.y))
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.x.nbytes + self.y.nbytes)
+
+
 def frame_to_arrays(
     frame: pd.DataFrame,
     feature_columns: list[str],
@@ -38,7 +55,50 @@ def frame_to_arrays(
         x = apply_feature_mask(x, mask)
     y = frame[target_col].to_numpy(dtype=np.float32, copy=True)
     valid = np.isfinite(x).all(axis=1) & np.isfinite(y)
-    return x[valid], y[valid]
+    return np.ascontiguousarray(x[valid]), np.ascontiguousarray(y[valid])
+
+
+def prepare_client_arrays(
+    frame: pd.DataFrame,
+    feature_columns: list[str],
+    target_col: str,
+    client_col: str = "client_id",
+    feature_masks: Mapping[str, np.ndarray] | None = None,
+) -> dict[str, ClientArrays]:
+    """Convert each client DataFrame to contiguous float32 arrays exactly once."""
+    result: dict[str, ClientArrays] = {}
+    for client_id, group in frame.groupby(client_col, sort=True, observed=True):
+        client_id = str(client_id)
+        mask = None if feature_masks is None else feature_masks.get(client_id)
+        x, y = frame_to_arrays(group, feature_columns, target_col, mask=mask)
+        if len(y) == 0:
+            raise ValueError(f"Client {client_id!r} contains no valid training rows.")
+        result[client_id] = ClientArrays(x=x, y=y)
+    return result
+
+
+def make_loader_from_arrays(
+    x: np.ndarray,
+    y: np.ndarray,
+    batch_size: int,
+    shuffle: bool,
+    seed: int | None = None,
+) -> DataLoader:
+    if len(y) == 0:
+        raise ValueError("A client split contains no valid rows.")
+    dataset = PanelDataset(x, y)
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed))
+    return DataLoader(
+        dataset,
+        batch_size=min(int(batch_size), len(dataset)),
+        shuffle=shuffle,
+        generator=generator,
+        num_workers=0,
+        persistent_workers=False,
+    )
 
 
 def make_loader(
@@ -48,16 +108,20 @@ def make_loader(
     batch_size: int,
     shuffle: bool,
     mask: np.ndarray | None = None,
+    seed: int | None = None,
 ) -> DataLoader:
     x, y = frame_to_arrays(frame, feature_columns, target_col, mask=mask)
-    if len(y) == 0:
-        raise ValueError("A client split contains no valid rows.")
-    dataset = PanelDataset(x, y)
-    return DataLoader(dataset, batch_size=min(batch_size, len(dataset)), shuffle=shuffle)
+    return make_loader_from_arrays(
+        x,
+        y,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        seed=seed,
+    )
 
 
 def clone_state_dict(model: nn.Module) -> OrderedDict[str, torch.Tensor]:
-    return OrderedDict((name, tensor.detach().clone()) for name, tensor in model.state_dict().items())
+    return OrderedDict((name, tensor.detach().cpu().clone()) for name, tensor in model.state_dict().items())
 
 
 def weighted_average_states(
@@ -74,12 +138,12 @@ def weighted_average_states(
     for key in states[0]:
         first = states[0][key]
         if not torch.is_floating_point(first):
-            result[key] = first.detach().clone()
+            result[key] = first.detach().cpu().clone()
             continue
-        result[key] = sum(
-            float(weight) * state[key].detach().to(dtype=first.dtype)
-            for state, weight in zip(states, weights_array, strict=True)
-        )
+        accumulator = torch.zeros_like(first, device="cpu")
+        for state, weight in zip(states, weights_array, strict=True):
+            accumulator.add_(state[key].detach().cpu().to(dtype=first.dtype), alpha=float(weight))
+        result[key] = accumulator
     return result
 
 
@@ -95,7 +159,7 @@ def predict_frame(
     x, _ = frame_to_arrays(frame, feature_columns, target_col, mask=mask)
     model.eval()
     predictions: list[np.ndarray] = []
-    with torch.no_grad():
+    with torch.inference_mode():
         for start in range(0, len(x), batch_size):
             xb = torch.as_tensor(x[start : start + batch_size], dtype=torch.float32, device=device)
             predictions.append(model(xb).detach().cpu().numpy())
@@ -164,7 +228,7 @@ def train_one_client(
         epoch_loss = 0.0
         epoch_count = 0
         for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
+            xb, yb = xb.to(device, non_blocking=False), yb.to(device, non_blocking=False)
             optimizer.zero_grad(set_to_none=True)
             prediction = model(xb)
             loss = criterion(prediction, yb)

@@ -5,6 +5,7 @@ import logging
 import platform
 import sys
 import time
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 from typing import Any, Mapping
@@ -14,7 +15,8 @@ import pandas as pd
 import torch
 
 from fapbench.algorithms import FederatedTrainer, train_centralized, train_local_models
-from fapbench.algorithms.common import frame_to_arrays
+from fapbench.algorithms.common import frame_to_arrays, prepare_client_arrays
+from fapbench.algorithms.parallel import ParallelClientRuntime
 from fapbench.config import load_config
 from fapbench.data import (
     PanelPreprocessor,
@@ -354,27 +356,64 @@ def _validation_selector(
         )
     )
     evaluate_every = int(selection_cfg.get("evaluate_every", 5))
+    evaluation_date = (
+        target_date_col if target_date_col in validation_frame.columns else date_col
+    )
+    prediction_batch_size = int(
+        config.get("performance", {}).get("prediction_batch_size", 65536)
+    )
+
+    # Validation is evaluated repeatedly. Materialize masked float32 arrays and
+    # date metadata once rather than re-grouping/copying the DataFrame at every
+    # checkpoint.
+    cached_x: list[np.ndarray] = []
+    cached_y: list[np.ndarray] = []
+    cached_dates: list[pd.Series] = []
+    for client_id, group in validation_frame.groupby(client_col, sort=True, observed=True):
+        client_id = str(client_id)
+        mask = None if feature_masks is None else feature_masks.get(client_id)
+        x, y = frame_to_arrays(group, features, target_col, mask=mask)
+        if len(y) != len(group):
+            raise ValueError(
+                "Non-finite validation rows remained after preprocessing; "
+                "cannot build the validation cache safely."
+            )
+        cached_x.append(x)
+        cached_y.append(y)
+        cached_dates.append(group[evaluation_date].reset_index(drop=True))
+    x_validation = np.ascontiguousarray(np.concatenate(cached_x, axis=0))
+    y_validation = np.ascontiguousarray(np.concatenate(cached_y, axis=0))
+    validation_dates = pd.concat(cached_dates, ignore_index=True)
+    if logger is not None:
+        logger.info(
+            "%s | validation cache | rows=%s | memory=%.1f MB | batch_size=%s",
+            name,
+            f"{len(y_validation):,}",
+            (x_validation.nbytes + y_validation.nbytes) / 1024**2,
+            prediction_batch_size,
+        )
 
     def score_fn(model: torch.nn.Module) -> float:
-        predictions = _prediction_frame(
-            model,
-            validation_frame,
-            features,
-            target_col,
-            date_col,
-            entity_col,
-            client_col,
-            device,
-            feature_masks,
-            target_date_col=target_date_col,
-            logger=None,
-            log_name=f"{name} validation",
-            client_log_interval=0,
+        device_obj = torch.device(device)
+        model = model.to(device_obj)
+        model.eval()
+        outputs: list[np.ndarray] = []
+        with torch.inference_mode():
+            for batch_start in range(0, len(x_validation), prediction_batch_size):
+                xb = torch.as_tensor(
+                    x_validation[batch_start : batch_start + prediction_batch_size],
+                    dtype=torch.float32,
+                    device=device_obj,
+                )
+                outputs.append(model(xb).detach().cpu().numpy())
+        predictions = pd.DataFrame(
+            {
+                evaluation_date: validation_dates,
+                "y_true": y_validation,
+                "y_pred": np.concatenate(outputs),
+            }
         )
-        metrics = predictive_metrics(
-            predictions,
-            date_col=_evaluation_date_col(predictions, config),
-        )
+        metrics = predictive_metrics(predictions, date_col=evaluation_date)
         if metric not in metrics:
             raise KeyError(
                 f"model_selection.metric={metric!r} is unavailable. "
@@ -585,6 +624,10 @@ def run(config: dict[str, Any]) -> Path:
     seed = int(config.get("seed", 42))
     set_seed(seed)
     torch.set_num_threads(int(config.get("torch_num_threads", 1)))
+    try:
+        torch.set_num_interop_threads(int(config.get("torch_num_interop_threads", 1)))
+    except RuntimeError:
+        pass
     output_dir = ensure_dir(config.get("output_dir", "outputs/run"))
     logging_cfg = config.get("logging", {})
     logger = configure_logger(
@@ -602,12 +645,13 @@ def run(config: dict[str, Any]) -> Path:
         "device", "cuda" if torch.cuda.is_available() else "cpu"
     )
     logger.info(
-        "FAP-Bench run start | config=%s | output=%s | seed=%s | device=%s | torch_threads=%s",
+        "FAP-Bench run start | config=%s | output=%s | seed=%s | device=%s | torch_threads=%s | interop_threads=%s",
         config.get("_config_path", "<in-memory>"),
         output_dir.resolve(),
         seed,
         device,
         torch.get_num_threads(),
+        torch.get_num_interop_threads(),
     )
     logger.info(
         "Data path | %s | file_size=%.1f MB",
@@ -1215,132 +1259,179 @@ def run(config: dict[str, Any]) -> Path:
                 write_json(metrics, output_dir / "metrics_local.json")
                 results.append({"method": "local", **metrics})
 
-        for algorithm in fed_cfg.get(
-            "algorithms", ["fedavg", "fedprox", "scaffold", "fedadam"]
-        ):
-            with log_stage(logger, f"Run {algorithm}"):
-                set_seed(seed)
-                selector = _validation_selector(
-                    algorithm,
-                    val,
-                    rounds,
-                    config,
-                    features,
-                    spec.target_col,
-                    spec.date_col,
-                    spec.entity_col,
-                    "client_id",
-                    device,
-                    feature_masks,
-                    spec.target_date_col,
-                    logger,
-                )
-                trainer = FederatedTrainer(
-                    algorithm=algorithm,
-                    model_fn=model_fn,
-                    feature_columns=features,
-                    target_col=spec.target_col,
-                    rounds=rounds,
-                    local_epochs=local_epochs,
-                    batch_size=int(fed_cfg.get("batch_size", 512)),
-                    client_lr=client_lr,
-                    weight_decay=float(fed_cfg.get("weight_decay", 0.0)),
-                    proximal_mu=float(fed_cfg.get("proximal_mu", 0.01)),
-                    participation_rate=participation_rate,
-                    seed=seed,
-                    device=device,
-                    server_lr=float(fed_cfg.get("server_lr", 1e-2)),
-                    server_beta1=float(fed_cfg.get("server_beta1", 0.9)),
-                    server_beta2=float(fed_cfg.get("server_beta2", 0.99)),
-                    server_tau=float(fed_cfg.get("server_tau", 1e-8)),
-                    client_optimizer=client_optimizer,
-                    client_momentum=client_momentum,
-                    logger=logger,
-                    round_log_interval=int(logging_cfg.get("round_interval", 1)),
-                    log_client_details=bool(logging_cfg.get("federated_client_details", False)),
-                    client_log_interval=int(logging_cfg.get("federated_client_interval", 1)),
-                    local_epoch_log_interval=int(logging_cfg.get("federated_local_epoch_interval", 0)),
-                )
-                model = trainer.fit(
-                    train,
-                    feature_masks=feature_masks,
-                    round_end_callback=selector,
-                )
-                if selector is not None:
-                    selector.restore(model)
-                    selector.to_frame().to_csv(
-                        output_dir / f"validation_history_{algorithm}.csv",
-                        index=False,
-                    )
-                _save_model_checkpoint(
-                    model,
-                    checkpoint_dir / f"{algorithm}.pt",
-                    {"method": algorithm, "seed": seed},
-                )
-                training_history = trainer.history.to_frame()
-                training_history.to_csv(
-                    output_dir / f"training_{algorithm}.csv", index=False
-                )
-                predictions = _prediction_frame(
-                    model,
-                    test,
-                    features,
-                    spec.target_col,
-                    spec.date_col,
-                    spec.entity_col,
-                    "client_id",
-                    device,
-                    feature_masks,
-                    target_date_col=spec.target_date_col,
-                    logger=logger,
-                    log_name=f"{algorithm} prediction",
-                    client_log_interval=prediction_client_log_interval,
-                )
-                metrics = _evaluate_and_save(
-                    algorithm, predictions, output_dir, config, logger
-                )
-                metrics["training_rounds"] = rounds
-                metrics["training_local_epochs"] = local_epochs
-                metrics["training_selected_client_local_passes"] = (
-                    rounds * local_epochs
-                )
-                metrics["training_effective_participation_rate"] = (
-                    effective_participation_rate
-                )
-                metrics["training_expected_global_data_passes"] = (
-                    rounds * local_epochs * effective_participation_rate
-                )
-                # Backward-compatible field now records full-dataset-equivalent passes.
-                metrics["training_local_passes"] = (
-                    rounds * local_epochs * effective_participation_rate
-                )
-                metrics["communicated_parameters"] = int(
-                    training_history["communicated_parameters"].sum()
-                )
-                metrics["communicated_bytes_fp32"] = (
-                    4 * metrics["communicated_parameters"]
-                )
-                if selector is not None:
-                    metrics.update(selector.metadata())
-                    if selector.best_step is not None:
-                        selected_row = training_history.loc[
-                            training_history["round"] == selector.best_step
-                        ]
-                        if not selected_row.empty:
-                            selected_communication = int(
-                                selected_row.iloc[-1][
-                                    "cumulative_communicated_parameters"
-                                ]
-                            )
-                            metrics[
-                                "selected_checkpoint_communicated_parameters"
-                            ] = selected_communication
-                            metrics[
-                                "selected_checkpoint_communicated_bytes_fp32"
-                            ] = 4 * selected_communication
-                write_json(metrics, output_dir / f"metrics_{algorithm}.json")
-                results.append({"method": algorithm, **metrics})
+        performance_cfg = config.get("performance", {})
+        parallel_client_count = int(performance_cfg.get("parallel_clients", 1))
+        cache_started = time.perf_counter()
+        federated_client_arrays = prepare_client_arrays(
+            train,
+            features,
+            spec.target_col,
+            client_col="client_id",
+            feature_masks=feature_masks,
+        )
+        logger.info(
+            "Federated client cache | clients=%s | rows=%s | memory=%.1f MB | elapsed=%s",
+            len(federated_client_arrays),
+            f"{sum(item.n_rows for item in federated_client_arrays.values()):,}",
+            sum(item.nbytes for item in federated_client_arrays.values()) / 1024**2,
+            format_seconds(time.perf_counter() - cache_started),
+        )
+        if parallel_client_count > 1 and torch.device(device).type == "cpu":
+            runtime_context = ParallelClientRuntime(
+                federated_client_arrays,
+                max_workers=min(parallel_client_count, len(federated_client_arrays)),
+                start_method=str(
+                    performance_cfg.get("multiprocessing_start_method", "spawn")
+                ),
+                worker_torch_threads=int(
+                    performance_cfg.get("worker_torch_threads", 1)
+                ),
+            )
+            logger.info(
+                "Reusable parallel runtime ready | workers=%s | reused_across_algorithms=true",
+                runtime_context.max_workers,
+            )
+        else:
+            runtime_context = nullcontext(None)
 
+        with runtime_context as parallel_runtime:
+            for algorithm in fed_cfg.get(
+                "algorithms", ["fedavg", "fedprox", "scaffold", "fedadam"]
+            ):
+                with log_stage(logger, f"Run {algorithm}"):
+                    set_seed(seed)
+                    selector = _validation_selector(
+                        algorithm,
+                        val,
+                        rounds,
+                        config,
+                        features,
+                        spec.target_col,
+                        spec.date_col,
+                        spec.entity_col,
+                        "client_id",
+                        device,
+                        feature_masks,
+                        spec.target_date_col,
+                        logger,
+                    )
+                    trainer = FederatedTrainer(
+                        algorithm=algorithm,
+                        model_fn=model_fn,
+                        feature_columns=features,
+                        target_col=spec.target_col,
+                        rounds=rounds,
+                        local_epochs=local_epochs,
+                        batch_size=int(fed_cfg.get("batch_size", 512)),
+                        client_lr=client_lr,
+                        weight_decay=float(fed_cfg.get("weight_decay", 0.0)),
+                        proximal_mu=float(fed_cfg.get("proximal_mu", 0.01)),
+                        participation_rate=participation_rate,
+                        seed=seed,
+                        device=device,
+                        server_lr=float(fed_cfg.get("server_lr", 1e-2)),
+                        server_beta1=float(fed_cfg.get("server_beta1", 0.9)),
+                        server_beta2=float(fed_cfg.get("server_beta2", 0.99)),
+                        server_tau=float(fed_cfg.get("server_tau", 1e-8)),
+                        client_optimizer=client_optimizer,
+                        client_momentum=client_momentum,
+                        logger=logger,
+                        round_log_interval=int(logging_cfg.get("round_interval", 1)),
+                        log_client_details=bool(logging_cfg.get("federated_client_details", False)),
+                        client_log_interval=int(logging_cfg.get("federated_client_interval", 1)),
+                        local_epoch_log_interval=int(logging_cfg.get("federated_local_epoch_interval", 0)),
+                        parallel_clients=int(performance_cfg.get("parallel_clients", 1)),
+                        multiprocessing_start_method=str(
+                            performance_cfg.get("multiprocessing_start_method", "spawn")
+                        ),
+                        worker_torch_threads=int(
+                            performance_cfg.get("worker_torch_threads", 1)
+                        ),
+                        cache_client_arrays=bool(
+                            performance_cfg.get("cache_client_arrays", True)
+                        ),
+                    )
+                    model = trainer.fit(
+                        train,
+                        feature_masks=feature_masks,
+                        round_end_callback=selector,
+                        client_arrays=federated_client_arrays,
+                        parallel_runtime=parallel_runtime,
+                    )
+                    if selector is not None:
+                        selector.restore(model)
+                        selector.to_frame().to_csv(
+                            output_dir / f"validation_history_{algorithm}.csv",
+                            index=False,
+                        )
+                    _save_model_checkpoint(
+                        model,
+                        checkpoint_dir / f"{algorithm}.pt",
+                        {"method": algorithm, "seed": seed},
+                    )
+                    training_history = trainer.history.to_frame()
+                    training_history.to_csv(
+                        output_dir / f"training_{algorithm}.csv", index=False
+                    )
+                    predictions = _prediction_frame(
+                        model,
+                        test,
+                        features,
+                        spec.target_col,
+                        spec.date_col,
+                        spec.entity_col,
+                        "client_id",
+                        device,
+                        feature_masks,
+                        target_date_col=spec.target_date_col,
+                        logger=logger,
+                        log_name=f"{algorithm} prediction",
+                        client_log_interval=prediction_client_log_interval,
+                    )
+                    metrics = _evaluate_and_save(
+                        algorithm, predictions, output_dir, config, logger
+                    )
+                    metrics["training_rounds"] = rounds
+                    metrics["training_local_epochs"] = local_epochs
+                    metrics["training_selected_client_local_passes"] = (
+                        rounds * local_epochs
+                    )
+                    metrics["training_effective_participation_rate"] = (
+                        effective_participation_rate
+                    )
+                    metrics["training_expected_global_data_passes"] = (
+                        rounds * local_epochs * effective_participation_rate
+                    )
+                    # Backward-compatible field now records full-dataset-equivalent passes.
+                    metrics["training_local_passes"] = (
+                        rounds * local_epochs * effective_participation_rate
+                    )
+                    metrics["communicated_parameters"] = int(
+                        training_history["communicated_parameters"].sum()
+                    )
+                    metrics["communicated_bytes_fp32"] = (
+                        4 * metrics["communicated_parameters"]
+                    )
+                    if selector is not None:
+                        metrics.update(selector.metadata())
+                        if selector.best_step is not None:
+                            selected_row = training_history.loc[
+                                training_history["round"] == selector.best_step
+                            ]
+                            if not selected_row.empty:
+                                selected_communication = int(
+                                    selected_row.iloc[-1][
+                                        "cumulative_communicated_parameters"
+                                    ]
+                                )
+                                metrics[
+                                    "selected_checkpoint_communicated_parameters"
+                                ] = selected_communication
+                                metrics[
+                                    "selected_checkpoint_communicated_bytes_fp32"
+                                ] = 4 * selected_communication
+                    write_json(metrics, output_dir / f"metrics_{algorithm}.json")
+                    results.append({"method": algorithm, **metrics})
         with log_stage(logger, "Save benchmark summary"):
             results_frame = pd.DataFrame(results)
             results_frame.to_csv(
