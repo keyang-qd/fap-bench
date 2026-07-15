@@ -41,6 +41,80 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+## Implemented experiments and scripts
+
+The repository currently implements the following experiments. This table is the
+source-of-truth for what can be run without adding new benchmark logic.
+
+| Script / configuration | Experiments already implemented | Main outputs |
+|---|---|---|
+| `scripts/run_benchmark.py` + any single-run YAML | Centralized oracle, masked centralized reference, local-only models, FedAvg, FedProx, SCAFFOLD, and FedAdam; validation checkpoint selection; predictive, portfolio, client-level, communication, timing, and peak-memory metrics | One complete run directory with checkpoints, predictions, metrics, schedules, and logs |
+| `configs/crsp_compustat_profitability_grid.yaml` | Core five-seed grid: FF12 full participation, 50% random participation, communication-efficient 10-round/5-local-epoch training, price above $5, and NYSE-breakpoint microcap exclusion | `grid_results.csv`, `grid_summary.csv`, and per-cell outputs |
+| `configs/crsp_compustat_profitability_heterogeneity_grid.yaml` | Controlled client-size imbalance; continuous-label skew; client-specific covariate shift; persistent heterogeneous availability; block outages; mild/moderate/severe feature-space heterogeneity | Realized perturbation files plus multi-seed method comparisons |
+| `configs/crsp_compustat_profitability_partition_grid.yaml` | Alternative client definitions: FF12 industries, exchange, training-fitted market-cap quintiles, and 12-client IID entity partition | Partition-comparison grid and saved assignments |
+| `configs/crsp_compustat_profitability_hyperparameter_grid.yaml` | FedProx proximal coefficient sweep and FedAdam server-learning-rate sweep; repeated baselines are disabled to reduce runtime | Multi-seed sensitivity results for the selected FL algorithm |
+| `scripts/run_grid.py` | Resumable multi-scenario and multi-seed execution; optional process-level parallel grid cells plus client-level parallel training inside each cell | Grid manifest, aggregate results, and persistent logs |
+| `scripts/benchmark_parallel_speed.py` | Serial-versus-parallel client-training timing check | Runtime comparison for choosing `parallel_clients` |
+| `scripts/analyze_results.py` | Paired return comparisons, Newey--West tests, and moving-block-bootstrap Sharpe intervals for completed methods | Statistical comparison tables |
+| `scripts/plot_results.py` | Plots from completed benchmark/grid result files | Publication-oriented figures |
+| `scripts/make_synthetic.py` + synthetic configs | Small synthetic smoke tests for all main training paths | Fast test panel and benchmark outputs |
+| `scripts/inspect_data.py` | Panel schema, coverage, date, entity, and missingness inspection | Data diagnostics |
+| `scripts/repair_completed_run.py` | Rebuilds summary artifacts for a completed run when aggregation was interrupted | Repaired result files without retraining |
+| `scripts/data_recipe2_revised.py` | CRSP--Compustat profitability panel construction, delisting-return adjustment, exact next-month targets, SIC retention, and profitability features | Aligned Parquet research panel |
+
+The controlled statistical experiments are explicit stress tests. Client-size
+imbalance keeps complete security histories but subsamples training entities;
+label skew uses training-only target-quantile weighted subsampling with a fixed
+retention fraction; covariate shift applies the same seeded client-specific affine
+feature pipeline to train, validation, and test periods. Every run saves the
+realized perturbation rather than relying only on requested configuration values.
+
+### Run the implemented grids
+
+```bash
+# Core protocol and investability robustness
+python -u scripts/run_grid.py \
+  --grid configs/crsp_compustat_profitability_grid.yaml
+
+# Statistical, temporal, and feature heterogeneity intensities
+python -u scripts/run_grid.py \
+  --grid configs/crsp_compustat_profitability_heterogeneity_grid.yaml
+
+# Alternative financial client partitions
+python -u scripts/run_grid.py \
+  --grid configs/crsp_compustat_profitability_partition_grid.yaml
+
+# FedProx and FedAdam sensitivity
+python -u scripts/run_grid.py \
+  --grid configs/crsp_compustat_profitability_hyperparameter_grid.yaml
+```
+
+### Parallel execution
+
+There are two controlled parallelism levels:
+
+1. `performance.parallel_clients` parallelizes independent client updates within
+   one federated run through a reusable shared-memory process pool.
+2. `grid_execution.parallel_runs` optionally runs different seed/scenario cells in
+   separate spawned processes. The grid automatically sets a per-run client-worker
+   budget from `max_total_client_workers` and a per-run PyTorch thread budget from
+   `max_total_torch_threads`.
+
+Laptop-safe settings keep `parallel_runs: 1` and use client-level parallelism. A
+high-memory workstation can start with:
+
+```yaml
+grid_execution:
+  parallel_runs: 2
+  max_total_client_workers: 8
+  max_total_torch_threads: 8
+  parallel_child_console: false
+```
+
+Parallel grid cells each load their own panel, so increasing `parallel_runs`
+requires enough RAM. When `parallel_runs > 1`, the single-process panel preload is
+automatically disabled. Completed cells remain resumable in either mode.
+
 ## Generate the financial panel
 
 Edit the input/output paths at the bottom of `scripts/data_recipe2_revised.py`, or call it directly:
@@ -148,6 +222,12 @@ including partial participation.
 - `source_validation.json`: target alignment, date consistency, universe, and industry checks;
 - `universe_filter.json`: price/microcap filter settings, cutoffs, and dropped rows;
 - `heterogeneity.json`: measured client-size, distribution, feature, and participation heterogeneity;
+- `statistical_heterogeneity.json`: requested and realized controlled statistical stress-test settings;
+- `client_size_imbalance.csv`: requested and realized entity/row retention by client;
+- `label_skew.csv`: client target-bin preferences and realized target-bin shares;
+- `covariate_shift_parameters.csv`: client-feature location and scale transformations;
+- `participation_schedule.csv`: exact active clients in every communication round;
+- `client_availability.csv`: realized and expected availability by client;
 - `partition_assignments.parquet`: formation/target dates and training-defined clients;
 - `feature_masks.csv`: client-specific feature availability;
 - `checkpoints/<method>.pt`: selected validation checkpoint for each method;
@@ -165,8 +245,10 @@ including partial participation.
 
 ## Multi-seed and robustness runs
 
-The production grid contains five seeds, partial participation, additional local
-steps, a $5 price screen, and a NYSE-breakpoint microcap exclusion:
+The core production grid contains five seeds, partial participation, additional
+local steps, a $5 price screen, and a NYSE-breakpoint microcap exclusion. Separate
+implemented grids cover controlled heterogeneity, alternative partitions, and
+FedProx/FedAdam hyperparameter sensitivity:
 
 ```bash
 python scripts/run_grid.py \

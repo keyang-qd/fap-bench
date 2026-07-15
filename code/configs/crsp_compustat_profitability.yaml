@@ -69,6 +69,34 @@ feature_heterogeneity:
   common_fraction: 1.0
   private_fraction: 0.5
 
+# Controlled statistical stress tests. Size and label-skew perturbations are
+# fitted/applied to the training split only; covariate-shift parameters are
+# fitted from the seed/client IDs and applied consistently to all time splits.
+statistical_heterogeneity:
+  enabled: false
+  client_size_imbalance:
+    enabled: false
+    imbalance_ratio: 5.0
+    min_entities_per_client: 1
+  label_skew:
+    enabled: false
+    n_bins: 5
+    concentration: 1.0
+    retain_fraction: 0.7
+  covariate_shift:
+    enabled: false
+    location_std: 0.25
+    log_scale_std: 0.15
+
+# Temporal stress tests use the exact same saved participation schedule for all
+# FL algorithms in a run. Modes: random (legacy), persistent, or block.
+temporal_heterogeneity:
+  enabled: false
+  mode: persistent
+  min_availability: 0.25
+  max_availability: 1.0
+  block_fraction: 0.35
+
 model:
   hidden_dims: [64, 32]
   dropout: 0.1

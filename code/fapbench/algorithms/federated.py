@@ -297,11 +297,35 @@ class FederatedTrainer:
         round_end_callback: Callable[[nn.Module, int, float], None] | None = None,
         client_arrays: Mapping[str, ClientArrays] | None = None,
         parallel_runtime: ParallelClientRuntime | None = None,
+        client_schedule: Mapping[int, list[str]] | None = None,
     ) -> nn.Module:
         client_ids = sorted(train_frame[self.client_col].astype(str).unique().tolist())
         if len(client_ids) < 2:
             raise ValueError("Federated training requires at least two clients.")
         sampler = ClientSampler(client_ids, self.participation_rate, self.seed)
+        resolved_schedule: dict[int, list[str]] | None = None
+        if client_schedule is not None:
+            resolved_schedule = {}
+            known_clients = set(client_ids)
+            for round_index in range(self.rounds):
+                if round_index not in client_schedule:
+                    raise KeyError(
+                        f"client_schedule is missing round index {round_index}."
+                    )
+                selected = sorted(
+                    set(str(value) for value in client_schedule[round_index])
+                )
+                unknown = set(selected) - known_clients
+                if unknown:
+                    raise ValueError(
+                        "client_schedule contains unknown clients: "
+                        f"{sorted(unknown)}"
+                    )
+                if not selected:
+                    raise ValueError(
+                        f"client_schedule round {round_index} has no active clients."
+                    )
+                resolved_schedule[round_index] = selected
         if self.algorithm == "scaffold":
             self._initialize_scaffold(client_ids)
 
@@ -393,7 +417,11 @@ class FederatedTrainer:
             for round_index in range(self.rounds):
                 round_number = round_index + 1
                 round_started = time.perf_counter()
-                selected = sampler.sample(round_index)
+                selected = (
+                    resolved_schedule[round_index]
+                    if resolved_schedule is not None
+                    else sampler.sample(round_index)
+                )
                 if self._should_log_round(round_number):
                     self.logger.info(
                         "%s | round=%s/%s | start | active_clients=%s | selected=%s",
@@ -406,6 +434,7 @@ class FederatedTrainer:
 
                 global_state = clone_state_dict(self.global_model)
                 results_by_client: dict[str, ClientTrainResult] = {}
+                client_updates_started = time.perf_counter()
 
                 if use_parallel:
                     assert runtime is not None
@@ -529,7 +558,9 @@ class FederatedTrainer:
                                 format_seconds(time.perf_counter() - client_started),
                             )
 
+                client_update_seconds = time.perf_counter() - client_updates_started
                 ordered_results = [results_by_client[client_id] for client_id in selected]
+                aggregation_started = time.perf_counter()
                 local_states = [numpy_state_to_torch(result.state) for result in ordered_results]
                 local_weights = [float(result.n_rows) for result in ordered_results]
                 local_losses = [result.mean_loss for result in ordered_results]
@@ -560,6 +591,7 @@ class FederatedTrainer:
                         mean_delta = sum(delta[name] for delta in scaffold_deltas) / len(scaffold_deltas)
                         self.server_control[name] = self.server_control[name] + scale * mean_delta
 
+                aggregation_seconds = time.perf_counter() - aggregation_started
                 vectors_per_client = 4 if self.algorithm == "scaffold" else 2
                 communicated = vectors_per_client * parameter_count * len(selected)
                 cumulative_communicated += communicated
@@ -573,6 +605,8 @@ class FederatedTrainer:
                     communicated_parameters=int(communicated),
                     cumulative_communicated_parameters=int(cumulative_communicated),
                     elapsed_seconds=float(round_elapsed),
+                    client_update_seconds=float(client_update_seconds),
+                    server_aggregation_seconds=float(aggregation_seconds),
                     parallel_workers=int(workers if use_parallel else 1),
                 )
                 if round_end_callback is not None:

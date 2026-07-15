@@ -103,3 +103,12 @@ def test_parallel_runtime_can_be_reused_across_algorithms() -> None:
                 parallel_runtime=runtime,
             )
             assert all(torch.isfinite(value).all() for value in model.state_dict().values())
+
+
+def test_federated_trainer_uses_supplied_client_schedule() -> None:
+    frame = _frame()
+    trainer = _trainer(1)
+    schedule = {0: ["A"], 1: ["B", "C"]}
+    trainer.fit(frame, client_schedule=schedule)
+    history = trainer.history.to_frame()
+    assert history["active_clients"].tolist() == [1, 2]

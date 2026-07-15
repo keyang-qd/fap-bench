@@ -7,6 +7,16 @@ continue_on_error: true
 preload_panel_once: true
 resume_completed: true
 
+# Two-level parallelism is supported. The laptop-safe default runs one grid cell
+# at a time while each cell trains clients in parallel. On a high-memory machine,
+# set parallel_runs to 2 and raise both total worker budgets accordingly.
+grid_execution:
+  parallel_runs: 1
+  max_total_client_workers: 4
+  max_total_torch_threads: 4
+  start_method: spawn
+  parallel_child_console: false
+
 # Keep one grid run active at a time. Each run already uses four parallel client
 # workers from the base config; parallelizing whole runs would oversubscribe CPU
 # and RAM on an Apple-silicon laptop.

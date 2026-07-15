@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import random
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows fallback
+    resource = None  # type: ignore[assignment]
 import time
 from datetime import date, datetime, time as datetime_time
 from enum import Enum
@@ -165,6 +170,22 @@ def format_seconds(seconds: float) -> str:
         return f"{int(minutes)}m {sec:.1f}s"
     hours, minute = divmod(minutes, 60)
     return f"{int(hours)}h {int(minute)}m {sec:.0f}s"
+
+
+
+def process_peak_rss_mb() -> float:
+    """Return peak resident memory for the current process in MiB.
+
+    ``ru_maxrss`` is reported in bytes on macOS and KiB on Linux. The value is
+    process-level and cumulative, so method-level metrics are snapshots of the
+    peak reached by the time a method finishes rather than isolated allocations.
+    """
+    if resource is None:
+        return float("nan")
+    value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    if sys.platform == "darwin":
+        return value / (1024**2)
+    return value / 1024.0
 
 
 def frame_memory_mb(frame: pd.DataFrame) -> float:

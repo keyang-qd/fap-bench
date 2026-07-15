@@ -1,0 +1,161 @@
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/crsp_compustat_profitability_heterogeneity_grid
+continue_on_error: true
+preload_panel_once: true
+resume_completed: true
+
+grid_execution:
+  # Laptop-safe default. On a high-memory workstation, use parallel_runs: 2,
+  # max_total_client_workers: 8, and max_total_torch_threads: 8.
+  parallel_runs: 1
+  max_total_client_workers: 4
+  max_total_torch_threads: 4
+  start_method: spawn
+  parallel_child_console: false
+
+child_logging:
+  console: true
+  round_interval: 5
+  epoch_interval: 5
+  local_client_interval: 3
+  prediction_client_interval: 3
+
+seeds: [11, 22, 33, 44, 55]
+
+scenarios:
+  - name: ff12_reference
+    overrides:
+      statistical_heterogeneity:
+        enabled: false
+      temporal_heterogeneity:
+        enabled: false
+      feature_heterogeneity:
+        enabled: false
+
+  - name: size_imbalance_ratio_5
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance:
+          enabled: true
+          imbalance_ratio: 5.0
+        label_skew:
+          enabled: false
+        covariate_shift:
+          enabled: false
+
+  - name: size_imbalance_ratio_20
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance:
+          enabled: true
+          imbalance_ratio: 20.0
+        label_skew:
+          enabled: false
+        covariate_shift:
+          enabled: false
+
+  - name: label_skew_mild
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance:
+          enabled: false
+        label_skew:
+          enabled: true
+          n_bins: 5
+          concentration: 2.0
+          retain_fraction: 0.6
+        covariate_shift:
+          enabled: false
+
+  - name: label_skew_strong
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance:
+          enabled: false
+        label_skew:
+          enabled: true
+          n_bins: 5
+          concentration: 0.2
+          retain_fraction: 0.6
+        covariate_shift:
+          enabled: false
+
+  - name: covariate_shift_mild
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance:
+          enabled: false
+        label_skew:
+          enabled: false
+        covariate_shift:
+          enabled: true
+          location_std: 0.15
+          log_scale_std: 0.10
+
+  - name: covariate_shift_strong
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance:
+          enabled: false
+        label_skew:
+          enabled: false
+        covariate_shift:
+          enabled: true
+          location_std: 0.50
+          log_scale_std: 0.30
+
+  - name: temporal_persistent_mild
+    overrides:
+      temporal_heterogeneity:
+        enabled: true
+        mode: persistent
+        min_availability: 0.60
+        max_availability: 1.00
+      federated:
+        participation_rate: 1.0
+
+  - name: temporal_persistent_strong
+    overrides:
+      temporal_heterogeneity:
+        enabled: true
+        mode: persistent
+        min_availability: 0.10
+        max_availability: 1.00
+      federated:
+        participation_rate: 1.0
+
+  - name: temporal_block_outages
+    overrides:
+      temporal_heterogeneity:
+        enabled: true
+        mode: block
+        block_fraction: 0.40
+      federated:
+        participation_rate: 1.0
+
+  - name: feature_heterogeneity_mild
+    overrides:
+      feature_heterogeneity:
+        enabled: true
+        common_fraction: 0.70
+        private_fraction: 0.70
+
+  - name: feature_heterogeneity_moderate
+    overrides:
+      feature_heterogeneity:
+        enabled: true
+        common_fraction: 0.50
+        private_fraction: 0.50
+
+  - name: feature_heterogeneity_severe
+    overrides:
+      feature_heterogeneity:
+        enabled: true
+        common_fraction: 0.15
+        private_fraction: 0.35

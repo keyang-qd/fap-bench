@@ -53,7 +53,17 @@ def main() -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     frame = make_panel(args.stocks, args.months, args.features, args.seed)
-    frame.to_parquet(output, index=False)
+    suffix = output.suffix.lower()
+    if suffix == ".csv":
+        frame.to_csv(output, index=False)
+    elif suffix in {".pkl", ".pickle"}:
+        frame.to_pickle(output)
+    elif suffix in {".parquet", ".pq"}:
+        frame.to_parquet(output, index=False)
+    else:
+        raise ValueError(
+            "Synthetic output must use .parquet, .csv, .pkl, or .pickle."
+        )
     print(f"Wrote {len(frame):,} rows to {output}")
 
 

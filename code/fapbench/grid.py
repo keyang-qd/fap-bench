@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 import gc
 import json
 import time
@@ -119,6 +121,11 @@ def _scenario_workload(base: dict[str, Any], scenario: dict[str, Any]) -> dict[s
     }
 
 
+def _run_grid_worker(config: dict[str, Any]) -> str:
+    """Top-level worker entry point for spawn-based parallel grid execution."""
+    return str(run(config, preloaded_raw_panel=None).resolve())
+
+
 def run_grid(grid_config: dict[str, Any]) -> Path:
     grid_path = Path(grid_config["_config_path"])
     base_path = Path(grid_config["base_config"])
@@ -145,6 +152,49 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
     continue_on_error = bool(grid_config.get("continue_on_error", True))
     resume_completed = bool(grid_config.get("resume_completed", True))
     preload_panel_once = bool(grid_config.get("preload_panel_once", True))
+    execution_cfg = grid_config.get("grid_execution", {})
+    parallel_runs = max(1, int(execution_cfg.get("parallel_runs", 1)))
+    process_start_method = str(execution_cfg.get("start_method", "spawn"))
+    base_client_workers = int(base.get("performance", {}).get("parallel_clients", 1))
+    max_total_client_workers = max(
+        1,
+        int(execution_cfg.get("max_total_client_workers", base_client_workers)),
+    )
+    per_run_client_workers = max(
+        1,
+        int(
+            execution_cfg.get(
+                "parallel_clients_per_run",
+                max_total_client_workers // parallel_runs,
+            )
+        ),
+    )
+    max_total_torch_threads = max(
+        1,
+        int(
+            execution_cfg.get(
+                "max_total_torch_threads",
+                max(1, int(base.get("torch_num_threads", 1))) * parallel_runs,
+            )
+        ),
+    )
+    per_run_torch_threads = max(
+        1,
+        int(
+            execution_cfg.get(
+                "torch_threads_per_run",
+                max_total_torch_threads // parallel_runs,
+            )
+        ),
+    )
+
+    if parallel_runs > 1 and preload_panel_once:
+        logger.warning(
+            "grid_execution.parallel_runs=%s disables preload_panel_once because "
+            "the full panel is not copied between spawned run processes.",
+            parallel_runs,
+        )
+        preload_panel_once = False
 
     logger.info(
         "Grid start | scenarios=%s | seeds=%s | total_runs=%s | output=%s",
@@ -155,10 +205,14 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
     )
     logger.info(
         "Grid execution | resume_completed=%s | preload_panel_once=%s | "
-        "runs_are_sequential=true | client_parallelism_inherited_from_base=%s",
+        "parallel_runs=%s | parallel_clients_per_run=%s | torch_threads_per_run=%s | "
+        "max_total_client_workers=%s",
         resume_completed,
         preload_panel_once,
-        base.get("performance", {}).get("parallel_clients", 1),
+        parallel_runs,
+        per_run_client_workers,
+        per_run_torch_threads,
+        max_total_client_workers,
     )
 
     workload_rows = [_scenario_workload(base, scenario) for scenario in scenarios]
@@ -186,9 +240,6 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
             row["total_pass_equivalents"],
         )
 
-    # Grid runs are intentionally sequential. Each run already uses a reusable
-    # multi-process client pool; parallelizing whole runs as well would create
-    # nested process pools and severe CPU/RAM oversubscription on a laptop.
     raw_panel: pd.DataFrame | None = None
     if preload_panel_once:
         data_path = resolve_data_path(base)
@@ -202,134 +253,182 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
                 frame_memory_mb(raw_panel),
             )
 
+    cells: list[dict[str, Any]] = []
+    cell_index = 0
+    for scenario in scenarios:
+        name = str(scenario["name"])
+        overrides = scenario.get("overrides", {})
+        for seed in seeds:
+            cell_index += 1
+            config = deep_update(base, overrides)
+            config["seed"] = int(seed)
+            run_dir = grid_output / name / f"seed_{seed}"
+            config["output_dir"] = str(run_dir)
+            config["logging"] = deep_update(
+                config.get("logging", {}), grid_config.get("child_logging", {})
+            )
+            config["logging"].setdefault("file", "run.log")
+            config["logging"].setdefault("console", True)
+            config.setdefault("performance", {})
+            config["performance"]["parallel_clients"] = per_run_client_workers
+            config["torch_num_threads"] = per_run_torch_threads
+            if parallel_runs > 1 and not bool(
+                execution_cfg.get("parallel_child_console", False)
+            ):
+                config["logging"]["console"] = False
+            cells.append(
+                {
+                    "index": cell_index,
+                    "scenario": name,
+                    "seed": int(seed),
+                    "run_dir": run_dir,
+                    "config": config,
+                }
+            )
+
     started = time.perf_counter()
     combined_rows: list[pd.DataFrame] = []
     run_manifest: list[dict[str, Any]] = []
-    run_index = 0
     completed_count = 0
     reused_count = 0
     completed_durations: list[float] = []
 
-    try:
-        for scenario in scenarios:
-            name = str(scenario["name"])
-            overrides = scenario.get("overrides", {})
-            logger.info("Scenario start | name=%s | seeds=%s", name, seeds)
-            for seed in seeds:
-                run_index += 1
-                config = deep_update(base, overrides)
-                config["seed"] = seed
-                run_dir = grid_output / name / f"seed_{seed}"
-                config["output_dir"] = str(run_dir)
-                config["logging"] = deep_update(
-                    config.get("logging", {}),
-                    grid_config.get("child_logging", {}),
-                )
-                config["logging"].setdefault("file", "run.log")
-                config["logging"].setdefault("console", True)
+    def record_success(
+        cell: dict[str, Any], output: Path, status: str, elapsed: float
+    ) -> None:
+        nonlocal completed_count, reused_count
+        if status == "completed":
+            completed_count += 1
+            completed_durations.append(float(elapsed))
+        else:
+            reused_count += 1
+        results = _collect_run_results(
+            output, scenario=cell["scenario"], seed=cell["seed"]
+        )
+        combined_rows.append(results)
+        run_manifest.append(
+            {
+                "scenario": cell["scenario"],
+                "seed": cell["seed"],
+                "status": status,
+                "output_dir": str(output.resolve()),
+                "elapsed_seconds": float(elapsed),
+                "parallel_runs": int(parallel_runs),
+                "parallel_clients_per_run": int(per_run_client_workers),
+            }
+        )
+        write_json(run_manifest, grid_output / "run_manifest.json")
+        logger.info(
+            "Grid run=%s/%s | scenario=%s | seed=%s | done | status=%s | "
+            "methods=%s | elapsed=%s",
+            cell["index"],
+            total_runs,
+            cell["scenario"],
+            cell["seed"],
+            status,
+            len(results),
+            format_seconds(elapsed),
+        )
 
+    def record_failure(cell: dict[str, Any], exc: BaseException, elapsed: float) -> None:
+        run_manifest.append(
+            {
+                "scenario": cell["scenario"],
+                "seed": cell["seed"],
+                "status": "failed",
+                "output_dir": str(cell["run_dir"].resolve()),
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "elapsed_seconds": float(elapsed),
+                "parallel_runs": int(parallel_runs),
+                "parallel_clients_per_run": int(per_run_client_workers),
+            }
+        )
+        write_json(run_manifest, grid_output / "run_manifest.json")
+        logger.error(
+            "Grid run=%s/%s | scenario=%s | seed=%s | failed | %s: %s",
+            cell["index"],
+            total_runs,
+            cell["scenario"],
+            cell["seed"],
+            type(exc).__name__,
+            exc,
+        )
+
+    try:
+        pending: list[dict[str, Any]] = []
+        for cell in cells:
+            if resume_completed and _completed_run_files(cell["run_dir"]):
+                record_success(cell, cell["run_dir"], "reused_completed", 0.0)
+            else:
+                pending.append(cell)
+
+        if parallel_runs == 1:
+            for cell in pending:
                 run_started = time.perf_counter()
                 logger.info(
                     "Grid run=%s/%s | scenario=%s | seed=%s | start",
-                    run_index,
-                    total_runs,
-                    name,
-                    seed,
+                    cell["index"], total_runs, cell["scenario"], cell["seed"]
                 )
                 try:
-                    if resume_completed and _completed_run_files(run_dir):
-                        output = run_dir
-                        status = "reused_completed"
-                        reused_count += 1
-                        logger.info(
-                            "Grid run=%s/%s | scenario=%s | seed=%s | "
-                            "resume hit; training skipped",
-                            run_index,
-                            total_runs,
-                            name,
-                            seed,
-                        )
-                    else:
-                        output = run(
-                            config,
-                            preloaded_raw_panel=raw_panel,
-                        )
-                        status = "completed"
-                        completed_count += 1
-
-                    results = _collect_run_results(
+                    output = run(
+                        cell["config"], preloaded_raw_panel=raw_panel
+                    )
+                    record_success(
+                        cell,
                         output,
-                        scenario=name,
-                        seed=seed,
-                    )
-                    combined_rows.append(results)
-                    run_manifest.append(
-                        {
-                            "scenario": name,
-                            "seed": seed,
-                            "status": status,
-                            "output_dir": str(output.resolve()),
-                            "elapsed_seconds": float(
-                                time.perf_counter() - run_started
-                            ),
-                        }
-                    )
-                    write_json(run_manifest, grid_output / "run_manifest.json")
-                    run_elapsed = time.perf_counter() - run_started
-                    if status == "completed":
-                        completed_durations.append(run_elapsed)
-                    remaining_runs = total_runs - run_index
-                    average_seconds = (
-                        float(np.mean(completed_durations))
-                        if completed_durations
-                        else run_elapsed
-                    )
-                    logger.info(
-                        "Grid run=%s/%s | scenario=%s | seed=%s | done | "
-                        "status=%s | methods=%s | elapsed=%s | "
-                        "rough_remaining=%s",
-                        run_index,
-                        total_runs,
-                        name,
-                        seed,
-                        status,
-                        len(results),
-                        format_seconds(run_elapsed),
-                        format_seconds(average_seconds * remaining_runs),
+                        "completed",
+                        time.perf_counter() - run_started,
                     )
                 except Exception as exc:
-                    run_manifest.append(
-                        {
-                            "scenario": name,
-                            "seed": seed,
-                            "status": "failed",
-                            "output_dir": str(run_dir.resolve()),
-                            "error_type": type(exc).__name__,
-                            "error_message": str(exc),
-                            "elapsed_seconds": float(
-                                time.perf_counter() - run_started
-                            ),
-                        }
-                    )
-                    write_json(run_manifest, grid_output / "run_manifest.json")
-                    logger.exception(
-                        "Grid run=%s/%s | scenario=%s | seed=%s | failed",
-                        run_index,
-                        total_runs,
-                        name,
-                        seed,
-                    )
+                    record_failure(cell, exc, time.perf_counter() - run_started)
                     if not continue_on_error:
                         raise
                 finally:
-                    # Encourage prompt release of model/data copies between long runs.
                     gc.collect()
+        else:
+            logger.info(
+                "Parallel grid launch | pending_runs=%s | workers=%s | start_method=%s",
+                len(pending), parallel_runs, process_start_method
+            )
+            context = get_context(process_start_method)
+            with ProcessPoolExecutor(
+                max_workers=parallel_runs, mp_context=context
+            ) as pool:
+                futures = {}
+                start_times: dict[Any, float] = {}
+                for cell in pending:
+                    logger.info(
+                        "Grid run=%s/%s | scenario=%s | seed=%s | submitted",
+                        cell["index"], total_runs, cell["scenario"], cell["seed"]
+                    )
+                    future = pool.submit(_run_grid_worker, cell["config"])
+                    futures[future] = cell
+                    start_times[future] = time.perf_counter()
+                for future in as_completed(futures):
+                    cell = futures[future]
+                    elapsed = time.perf_counter() - start_times[future]
+                    try:
+                        output = Path(future.result())
+                        record_success(cell, output, "completed", elapsed)
+                    except Exception as exc:
+                        record_failure(cell, exc, elapsed)
+                        if not continue_on_error:
+                            for pending_future in futures:
+                                pending_future.cancel()
+                            raise
 
         with log_stage(logger, "Aggregate grid outputs"):
+            run_manifest.sort(
+                key=lambda row: (str(row.get("scenario", "")), int(row.get("seed", 0)))
+            )
             write_json(run_manifest, grid_output / "run_manifest.json")
             if not combined_rows:
                 raise RuntimeError("Every grid run failed; no results can be aggregated.")
             combined = pd.concat(combined_rows, ignore_index=True).copy()
+            combined = combined.sort_values(
+                ["scenario", "seed", "method"], kind="stable"
+            ).reset_index(drop=True)
             combined.to_csv(grid_output / "grid_results.csv", index=False)
 
             numeric = [
@@ -361,13 +460,12 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
         return grid_output
     except Exception:
         logger.exception(
-            "Grid failed | processed_runs=%s/%s | elapsed=%s",
-            run_index,
+            "Grid failed | manifest_rows=%s/%s | elapsed=%s",
+            len(run_manifest),
             total_runs,
             format_seconds(time.perf_counter() - started),
         )
         raise
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run multiple FAP-Bench scenarios and seeds.")

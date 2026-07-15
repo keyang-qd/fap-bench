@@ -43,10 +43,17 @@ from fapbench.selection import ValidationCheckpoint, combine_selection_histories
 from fapbench.partition import (
     ClientSampler,
     add_ff12_column,
+    apply_client_size_imbalance,
+    apply_covariate_shift,
     apply_feature_masks_to_frame,
+    apply_regression_label_skew,
     assign_domain_clients,
     assign_iid_clients,
+    build_covariate_shift_parameters,
     build_feature_masks,
+    covariate_shift_frame,
+    schedule_to_frame,
+    temporal_availability_report,
     temporal_unavailability,
 )
 from fapbench.utils import (
@@ -55,6 +62,7 @@ from fapbench.utils import (
     format_seconds,
     log_frame,
     log_stage,
+    process_peak_rss_mb,
     set_seed,
     write_json,
 )
@@ -596,6 +604,7 @@ def _evaluate_and_save(
                 uncalibrated_global_metrics,
             )
         )
+    result["evaluation_elapsed_seconds"] = float(time.perf_counter() - started)
     write_json(result, output_dir / f"metrics_{name}.json")
     if logger is not None:
         highlights = []
@@ -876,6 +885,74 @@ def run(
             raise ValueError(
                 "model_selection.enabled=true requires a non-empty validation split."
             )
+
+        statistical_cfg = config.get("statistical_heterogeneity", {})
+        statistical_report: dict[str, Any] = {"enabled": False}
+        if bool(statistical_cfg.get("enabled", False)):
+            statistical_report = {"enabled": True}
+            size_cfg = statistical_cfg.get("client_size_imbalance", {})
+            if bool(size_cfg.get("enabled", False)):
+                with log_stage(logger, "Apply client-size imbalance"):
+                    rows_before = len(train)
+                    train, size_report = apply_client_size_imbalance(
+                        train,
+                        entity_col=spec.entity_col,
+                        client_col="client_id",
+                        imbalance_ratio=float(size_cfg.get("imbalance_ratio", 5.0)),
+                        seed=seed,
+                        min_entities_per_client=int(
+                            size_cfg.get("min_entities_per_client", 1)
+                        ),
+                    )
+                    size_report.to_csv(
+                        output_dir / "client_size_imbalance.csv", index=False
+                    )
+                    statistical_report.update(
+                        {
+                            "client_size_imbalance_enabled": True,
+                            "client_size_imbalance_ratio_requested": float(
+                                size_cfg.get("imbalance_ratio", 5.0)
+                            ),
+                            "client_size_rows_before": int(rows_before),
+                            "client_size_rows_after": int(len(train)),
+                            "client_size_retained_fraction": float(
+                                len(train) / rows_before
+                            ),
+                        }
+                    )
+            label_cfg = statistical_cfg.get("label_skew", {})
+            if bool(label_cfg.get("enabled", False)):
+                with log_stage(logger, "Apply regression-label skew"):
+                    rows_before = len(train)
+                    train, label_report = apply_regression_label_skew(
+                        train,
+                        target_col=spec.target_col,
+                        client_col="client_id",
+                        n_bins=int(label_cfg.get("n_bins", 5)),
+                        concentration=float(label_cfg.get("concentration", 1.0)),
+                        retain_fraction=float(label_cfg.get("retain_fraction", 0.7)),
+                        seed=seed,
+                    )
+                    label_report.to_csv(
+                        output_dir / "label_skew.csv", index=False
+                    )
+                    statistical_report.update(
+                        {
+                            "label_skew_enabled": True,
+                            "label_skew_concentration": float(
+                                label_cfg.get("concentration", 1.0)
+                            ),
+                            "label_skew_retain_fraction_requested": float(
+                                label_cfg.get("retain_fraction", 0.7)
+                            ),
+                            "label_skew_rows_before": int(rows_before),
+                            "label_skew_rows_after": int(len(train)),
+                            "label_skew_retained_fraction": float(
+                                len(train) / rows_before
+                            ),
+                        }
+                    )
+
         clients = sorted(train["client_id"].astype(str).unique().tolist())
         evaluation_clients = set(test["client_id"].astype(str).unique())
         if not val.empty:
@@ -883,9 +960,48 @@ def run(
         unseen_clients = evaluation_clients - set(clients)
         if unseen_clients:
             raise ValueError(
-                "Validation/test clients absent from training: "
-                f"{sorted(unseen_clients)}"
+                "Validation/test clients absent from training after controlled "
+                f"heterogeneity: {sorted(unseen_clients)}"
             )
+
+        covariate_cfg = statistical_cfg.get("covariate_shift", {})
+        if bool(statistical_cfg.get("enabled", False)) and bool(
+            covariate_cfg.get("enabled", False)
+        ):
+            with log_stage(logger, "Apply client-specific covariate shift"):
+                locations, scales = build_covariate_shift_parameters(
+                    clients,
+                    features,
+                    location_std=float(covariate_cfg.get("location_std", 0.25)),
+                    log_scale_std=float(covariate_cfg.get("log_scale_std", 0.15)),
+                    seed=seed,
+                )
+                train = apply_covariate_shift(
+                    train, features, locations, scales, client_col="client_id"
+                )
+                if not val.empty:
+                    val = apply_covariate_shift(
+                        val, features, locations, scales, client_col="client_id"
+                    )
+                test = apply_covariate_shift(
+                    test, features, locations, scales, client_col="client_id"
+                )
+                covariate_shift_frame(features, locations, scales).to_csv(
+                    output_dir / "covariate_shift_parameters.csv", index=False
+                )
+                statistical_report.update(
+                    {
+                        "covariate_shift_enabled": True,
+                        "covariate_location_std": float(
+                            covariate_cfg.get("location_std", 0.25)
+                        ),
+                        "covariate_log_scale_std": float(
+                            covariate_cfg.get("log_scale_std", 0.15)
+                        ),
+                    }
+                )
+        write_json(statistical_report, output_dir / "statistical_heterogeneity.json")
+
         log_frame(logger, "Training split", train, date_col=split_date_col, entity_col=spec.entity_col, client_col="client_id")
         if not val.empty:
             log_frame(logger, "Validation split", val, date_col=split_date_col, entity_col=spec.entity_col, client_col="client_id")
@@ -923,12 +1039,42 @@ def run(
         fed_cfg = config.get("federated", {})
         rounds = int(fed_cfg.get("rounds", 20))
         participation_rate = float(fed_cfg.get("participation_rate", 1.0))
-        sampler = ClientSampler(clients, participation_rate, seed)
+        temporal_cfg = config.get("temporal_heterogeneity", {})
+        temporal_enabled = bool(temporal_cfg.get("enabled", False))
+        temporal_mode = (
+            str(temporal_cfg.get("mode", "persistent")).lower()
+            if temporal_enabled
+            else "random"
+        )
+        sampler = ClientSampler(
+            clients,
+            participation_rate,
+            seed,
+            mode=temporal_mode,
+            total_rounds=rounds,
+            min_availability=float(temporal_cfg.get("min_availability", 0.25)),
+            max_availability=float(temporal_cfg.get("max_availability", 1.0)),
+            block_fraction=float(temporal_cfg.get("block_fraction", 0.35)),
+        )
         schedule = sampler.schedule(rounds)
         effective_participation_rate = float(
             np.mean([len(active) / len(clients) for active in schedule.values()])
         )
         temporal_h = temporal_unavailability(schedule, clients)
+        participation_frame = schedule_to_frame(schedule)
+        participation_frame.to_csv(
+            output_dir / "participation_schedule.csv", index=False
+        )
+        client_availability, temporal_summary = temporal_availability_report(
+            schedule, clients
+        )
+        expected_availability = sampler.availability_probabilities()
+        client_availability["expected_availability"] = client_availability[
+            "client_id"
+        ].map(expected_availability)
+        client_availability.to_csv(
+            output_dir / "client_availability.csv", index=False
+        )
 
         with log_stage(logger, "Measure heterogeneity"):
             heterogeneity = partition_heterogeneity_report(
@@ -939,13 +1085,19 @@ def run(
                 temporal_unavailability_value=temporal_h,
                 seed=seed,
             )
+            heterogeneity.update(temporal_summary)
+            heterogeneity["temporal_mode"] = temporal_mode
             heterogeneity["feature_columns"] = features
             heterogeneity["split_date_col"] = split_date_col
+            for key, value in statistical_report.items():
+                if isinstance(value, (int, float, bool, str)):
+                    heterogeneity[f"controlled_{key}"] = value
             write_json(heterogeneity, output_dir / "heterogeneity.json")
             numeric_h = {
                 key: value
                 for key, value in heterogeneity.items()
                 if isinstance(value, (int, float, np.integer, np.floating))
+                and not isinstance(value, bool)
             }
             logger.info(
                 "Heterogeneity | %s",
@@ -994,6 +1146,7 @@ def run(
 
         if bool(baseline_cfg.get("centralized", True)):
             method_name = "centralized_oracle" if feature_masks else "centralized"
+            method_started = time.perf_counter()
             with log_stage(logger, f"Run {method_name}"):
                 set_seed(seed)
                 selector = _validation_selector(
@@ -1011,6 +1164,7 @@ def run(
                     spec.target_date_col,
                     logger,
                 )
+                training_started = time.perf_counter()
                 centralized = train_centralized(
                     train,
                     model_fn,
@@ -1028,6 +1182,7 @@ def run(
                     log_name=method_name,
                     epoch_end_callback=selector,
                 )
+                training_elapsed = time.perf_counter() - training_started
                 if selector is not None:
                     selector.restore(centralized)
                     selector.to_frame().to_csv(
@@ -1039,6 +1194,7 @@ def run(
                     checkpoint_dir / f"{method_name}.pt",
                     {"method": method_name, "seed": seed},
                 )
+                prediction_started = time.perf_counter()
                 predictions = _prediction_frame(
                     centralized,
                     test,
@@ -1054,19 +1210,25 @@ def run(
                     log_name=f"{method_name} prediction",
                     client_log_interval=prediction_client_log_interval,
                 )
+                prediction_elapsed = time.perf_counter() - prediction_started
                 metrics = _evaluate_and_save(
                     method_name, predictions, output_dir, config, logger
                 )
+                metrics["training_elapsed_seconds"] = float(training_elapsed)
+                metrics["prediction_elapsed_seconds"] = float(prediction_elapsed)
                 metrics["training_epochs"] = baseline_epochs
                 metrics["training_local_passes"] = baseline_epochs
                 if selector is not None:
                     metrics.update(selector.metadata())
+                metrics["method_elapsed_seconds"] = float(time.perf_counter() - method_started)
+                metrics["process_peak_rss_mb"] = process_peak_rss_mb()
                 write_json(metrics, output_dir / f"metrics_{method_name}.json")
                 results.append({"method": method_name, **metrics})
 
         if feature_masks and bool(
             baseline_cfg.get("centralized_masked", True)
         ):
+            method_started = time.perf_counter()
             with log_stage(logger, "Run centralized_masked"):
                 set_seed(seed)
                 masked_train = apply_feature_masks_to_frame(
@@ -1093,6 +1255,7 @@ def run(
                     spec.target_date_col,
                     logger,
                 )
+                training_started = time.perf_counter()
                 centralized_masked = train_centralized(
                     masked_train,
                     model_fn,
@@ -1110,6 +1273,7 @@ def run(
                     log_name="centralized_masked",
                     epoch_end_callback=selector,
                 )
+                training_elapsed = time.perf_counter() - training_started
                 if selector is not None:
                     selector.restore(centralized_masked)
                     selector.to_frame().to_csv(
@@ -1121,6 +1285,7 @@ def run(
                     checkpoint_dir / "centralized_masked.pt",
                     {"method": "centralized_masked", "seed": seed},
                 )
+                prediction_started = time.perf_counter()
                 predictions = _prediction_frame(
                     centralized_masked,
                     masked_test,
@@ -1136,19 +1301,25 @@ def run(
                     log_name="centralized_masked prediction",
                     client_log_interval=prediction_client_log_interval,
                 )
+                prediction_elapsed = time.perf_counter() - prediction_started
                 metrics = _evaluate_and_save(
                     "centralized_masked", predictions, output_dir, config, logger
                 )
+                metrics["training_elapsed_seconds"] = float(training_elapsed)
+                metrics["prediction_elapsed_seconds"] = float(prediction_elapsed)
                 metrics["training_epochs"] = baseline_epochs
                 metrics["training_local_passes"] = baseline_epochs
                 if selector is not None:
                     metrics.update(selector.metadata())
+                metrics["method_elapsed_seconds"] = float(time.perf_counter() - method_started)
+                metrics["process_peak_rss_mb"] = process_peak_rss_mb()
                 write_json(
                     metrics, output_dir / "metrics_centralized_masked.json"
                 )
                 results.append({"method": "centralized_masked", **metrics})
 
         if bool(baseline_cfg.get("local", True)):
+            method_started = time.perf_counter()
             with log_stage(logger, "Run local baseline"):
                 set_seed(seed)
                 local_selectors: dict[str, ValidationCheckpoint] = {}
@@ -1183,6 +1354,7 @@ def run(
                         if selector is not None:
                             local_selectors[client_id] = selector
                             local_callbacks[client_id] = selector
+                training_started = time.perf_counter()
                 local_models = train_local_models(
                     train,
                     model_fn,
@@ -1201,6 +1373,7 @@ def run(
                     epoch_log_interval=int(logging_cfg.get("local_epoch_interval", 0)),
                     epoch_end_callbacks=local_callbacks or None,
                 )
+                training_elapsed = time.perf_counter() - training_started
                 for client_id, selector in local_selectors.items():
                     if client_id in local_models:
                         selector.restore(local_models[client_id])
@@ -1216,6 +1389,7 @@ def run(
                     checkpoint_dir / "local.pt",
                     {"method": "local", "seed": seed},
                 )
+                prediction_started = time.perf_counter()
                 predictions = _local_prediction_frame(
                     local_models,
                     test,
@@ -1230,6 +1404,7 @@ def run(
                     logger=logger,
                     client_log_interval=prediction_client_log_interval,
                 )
+                prediction_elapsed = time.perf_counter() - prediction_started
                 metrics = _evaluate_and_save(
                     "local",
                     predictions,
@@ -1238,6 +1413,8 @@ def run(
                     logger,
                     is_local=True,
                 )
+                metrics["training_elapsed_seconds"] = float(training_elapsed)
+                metrics["prediction_elapsed_seconds"] = float(prediction_elapsed)
                 metrics["training_epochs"] = baseline_epochs
                 metrics["training_local_passes"] = baseline_epochs
                 if local_selectors:
@@ -1268,6 +1445,8 @@ def run(
                     metrics["selection_metric"] = next(
                         iter(local_selectors.values())
                     ).metric
+                metrics["method_elapsed_seconds"] = float(time.perf_counter() - method_started)
+                metrics["process_peak_rss_mb"] = process_peak_rss_mb()
                 write_json(metrics, output_dir / "metrics_local.json")
                 results.append({"method": "local", **metrics})
 
@@ -1310,6 +1489,7 @@ def run(
             for algorithm in fed_cfg.get(
                 "algorithms", ["fedavg", "fedprox", "scaffold", "fedadam"]
             ):
+                method_started = time.perf_counter()
                 with log_stage(logger, f"Run {algorithm}"):
                     set_seed(seed)
                     selector = _validation_selector(
@@ -1363,13 +1543,16 @@ def run(
                             performance_cfg.get("cache_client_arrays", True)
                         ),
                     )
+                    training_started = time.perf_counter()
                     model = trainer.fit(
                         train,
                         feature_masks=feature_masks,
                         round_end_callback=selector,
                         client_arrays=federated_client_arrays,
                         parallel_runtime=parallel_runtime,
+                        client_schedule=schedule,
                     )
+                    training_elapsed = time.perf_counter() - training_started
                     if selector is not None:
                         selector.restore(model)
                         selector.to_frame().to_csv(
@@ -1385,6 +1568,7 @@ def run(
                     training_history.to_csv(
                         output_dir / f"training_{algorithm}.csv", index=False
                     )
+                    prediction_started = time.perf_counter()
                     predictions = _prediction_frame(
                         model,
                         test,
@@ -1400,9 +1584,12 @@ def run(
                         log_name=f"{algorithm} prediction",
                         client_log_interval=prediction_client_log_interval,
                     )
+                    prediction_elapsed = time.perf_counter() - prediction_started
                     metrics = _evaluate_and_save(
                         algorithm, predictions, output_dir, config, logger
                     )
+                    metrics["training_elapsed_seconds"] = float(training_elapsed)
+                    metrics["prediction_elapsed_seconds"] = float(prediction_elapsed)
                     metrics["training_rounds"] = rounds
                     metrics["training_local_epochs"] = local_epochs
                     metrics["training_selected_client_local_passes"] = (
@@ -1424,6 +1611,15 @@ def run(
                     metrics["communicated_bytes_fp32"] = (
                         4 * metrics["communicated_parameters"]
                     )
+                    metrics["training_round_elapsed_seconds"] = float(
+                        training_history["elapsed_seconds"].sum()
+                    )
+                    metrics["client_update_elapsed_seconds"] = float(
+                        training_history["client_update_seconds"].sum()
+                    )
+                    metrics["server_aggregation_elapsed_seconds"] = float(
+                        training_history["server_aggregation_seconds"].sum()
+                    )
                     if selector is not None:
                         metrics.update(selector.metadata())
                         if selector.best_step is not None:
@@ -1442,6 +1638,8 @@ def run(
                                 metrics[
                                     "selected_checkpoint_communicated_bytes_fp32"
                                 ] = 4 * selected_communication
+                    metrics["method_elapsed_seconds"] = float(time.perf_counter() - method_started)
+                    metrics["process_peak_rss_mb"] = process_peak_rss_mb()
                     write_json(metrics, output_dir / f"metrics_{algorithm}.json")
                     results.append({"method": algorithm, **metrics})
         with log_stage(logger, "Save benchmark summary"):
@@ -1464,6 +1662,7 @@ def run(
                 "train_rows": int(len(train)),
                 "validation_rows": int(len(val)),
                 "test_rows": int(len(test)),
+                "process_peak_rss_mb": process_peak_rss_mb(),
             }
         )
         write_json(run_metadata, output_dir / "run_metadata.json")
