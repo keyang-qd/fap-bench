@@ -32,6 +32,7 @@ fapbench/partition/industry.py
 fapbench/partition/temporal.py
 tests/test_data_alignment.py
 tests/test_evaluation_protocol.py
+tests/test_grid_execution.py
 tests/test_industry_partition.py
 tests/test_json_utils.py
 tests/test_parallel_training.py

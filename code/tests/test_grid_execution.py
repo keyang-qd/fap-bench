@@ -34,3 +34,18 @@ def test_more_local_steps_holds_total_local_epoch_budget() -> None:
     )
     fed = scenario["overrides"]["federated"]
     assert fed["rounds"] * fed["local_epochs"] == 50
+
+
+def test_collect_run_results_avoids_fragmentation(tmp_path: Path) -> None:
+    from fapbench.grid import _collect_run_results
+
+    pd.DataFrame([
+        {"method": "fedavg", **{f"metric_{i}": float(i) for i in range(120)}}
+    ]).to_csv(tmp_path / "benchmark_results.csv", index=False)
+    (tmp_path / "heterogeneity.json").write_text(
+        json.dumps({f"h{i}": float(i) for i in range(30)}), encoding="utf-8"
+    )
+    result = _collect_run_results(tmp_path, scenario="s", seed=11)
+    assert result.loc[0, "scenario"] == "s"
+    assert result.loc[0, "seed"] == 11
+    assert result.loc[0, "heterogeneity_h29"] == 29.0

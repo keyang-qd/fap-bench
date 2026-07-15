@@ -11,7 +11,9 @@ resume_completed: true
 # workers from the base config; parallelizing whole runs would oversubscribe CPU
 # and RAM on an Apple-silicon laptop.
 child_logging:
-  console: false
+  # Show one message every five rounds in the terminal so a long child run
+  # does not look frozen. Full detail is still written to each run.log.
+  console: true
   round_interval: 5
   epoch_interval: 5
   local_client_interval: 3

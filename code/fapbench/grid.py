@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from fapbench.config import deep_update, load_config
@@ -45,15 +46,77 @@ def _collect_run_results(
     scenario: str,
     seed: int,
 ) -> pd.DataFrame:
-    results = pd.read_csv(output / "benchmark_results.csv")
-    results.insert(0, "seed", seed)
-    results.insert(0, "scenario", scenario)
+    """Collect one run without repeatedly inserting columns.
+
+    Building all metadata columns in one DataFrame and concatenating once avoids
+    pandas block fragmentation, which previously produced dozens of
+    PerformanceWarning messages during every grid run.
+    """
+    results = pd.read_csv(output / "benchmark_results.csv").reset_index(drop=True)
     with (output / "heterogeneity.json").open("r", encoding="utf-8") as handle:
         heterogeneity = json.load(handle)
-    for key, value in heterogeneity.items():
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            results[f"heterogeneity_{key}"] = value
-    return results
+
+    metadata: dict[str, Any] = {
+        "scenario": scenario,
+        "seed": int(seed),
+    }
+    metadata.update(
+        {
+            f"heterogeneity_{key}": value
+            for key, value in heterogeneity.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+    )
+    metadata_frame = pd.DataFrame(
+        {key: [value] * len(results) for key, value in metadata.items()}
+    )
+    return pd.concat([metadata_frame, results], axis=1, copy=False).copy()
+
+
+def _scenario_workload(base: dict[str, Any], scenario: dict[str, Any]) -> dict[str, Any]:
+    """Return a transparent, approximate compute budget for one seed.
+
+    A full-client-pass equivalent is one local epoch over all training clients.
+    This is not a wall-clock prediction, but it makes smoke-test and full-grid
+    configurations directly comparable before expensive training starts.
+    """
+    config = deep_update(base, scenario.get("overrides", {}))
+    fed = config.get("federated", {})
+    baselines = config.get("baselines", {})
+    algorithms = list(fed.get("algorithms", []))
+    rounds = int(fed.get("rounds", 0))
+    local_epochs = int(fed.get("local_epochs", 1))
+    participation = float(fed.get("participation_rate", 1.0))
+    fl_passes = len(algorithms) * rounds * local_epochs * participation
+
+    if bool(baselines.get("match_federated_local_passes", False)):
+        baseline_epochs = max(1, int(np.ceil(rounds * local_epochs * participation)))
+    else:
+        configured = baselines.get("epochs", 5)
+        baseline_epochs = (
+            max(1, int(np.ceil(rounds * local_epochs * participation)))
+            if configured is None
+            else int(configured)
+        )
+    baseline_methods = int(bool(baselines.get("centralized", True)))
+    baseline_methods += int(bool(baselines.get("local", True)))
+    # centralized_masked is relevant only in feature-heterogeneity scenarios.
+    feature_enabled = bool(config.get("feature_heterogeneity", {}).get("enabled", False))
+    if feature_enabled:
+        baseline_methods += int(bool(baselines.get("centralized_masked", True)))
+    baseline_passes = baseline_methods * baseline_epochs
+    return {
+        "name": str(scenario.get("name", "unnamed")),
+        "algorithms": algorithms,
+        "rounds": rounds,
+        "local_epochs": local_epochs,
+        "participation_rate": participation,
+        "fl_full_client_passes": float(fl_passes),
+        "baseline_methods": baseline_methods,
+        "baseline_epochs": baseline_epochs,
+        "baseline_full_data_passes": float(baseline_passes),
+        "total_pass_equivalents": float(fl_passes + baseline_passes),
+    }
 
 
 def run_grid(grid_config: dict[str, Any]) -> Path:
@@ -98,6 +161,31 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
         base.get("performance", {}).get("parallel_clients", 1),
     )
 
+    workload_rows = [_scenario_workload(base, scenario) for scenario in scenarios]
+    total_pass_equivalents = sum(
+        row["total_pass_equivalents"] for row in workload_rows
+    ) * len(seeds)
+    logger.info(
+        "Grid workload estimate | full_client_pass_equivalents=%.1f | "
+        "note=relative_compute_budget_not_wall_clock",
+        total_pass_equivalents,
+    )
+    for row in workload_rows:
+        logger.info(
+            "Scenario budget | name=%s | algorithms=%s | rounds=%s | "
+            "local_epochs=%s | participation=%.3f | fl_passes=%.1f | "
+            "baseline_methods=%s | baseline_epochs=%s | total_passes=%.1f",
+            row["name"],
+            ",".join(row["algorithms"]) or "none",
+            row["rounds"],
+            row["local_epochs"],
+            row["participation_rate"],
+            row["fl_full_client_passes"],
+            row["baseline_methods"],
+            row["baseline_epochs"],
+            row["total_pass_equivalents"],
+        )
+
     # Grid runs are intentionally sequential. Each run already uses a reusable
     # multi-process client pool; parallelizing whole runs as well would create
     # nested process pools and severe CPU/RAM oversubscription on a laptop.
@@ -120,6 +208,7 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
     run_index = 0
     completed_count = 0
     reused_count = 0
+    completed_durations: list[float] = []
 
     try:
         for scenario in scenarios:
@@ -186,16 +275,27 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
                         }
                     )
                     write_json(run_manifest, grid_output / "run_manifest.json")
+                    run_elapsed = time.perf_counter() - run_started
+                    if status == "completed":
+                        completed_durations.append(run_elapsed)
+                    remaining_runs = total_runs - run_index
+                    average_seconds = (
+                        float(np.mean(completed_durations))
+                        if completed_durations
+                        else run_elapsed
+                    )
                     logger.info(
                         "Grid run=%s/%s | scenario=%s | seed=%s | done | "
-                        "status=%s | methods=%s | elapsed=%s",
+                        "status=%s | methods=%s | elapsed=%s | "
+                        "rough_remaining=%s",
                         run_index,
                         total_runs,
                         name,
                         seed,
                         status,
                         len(results),
-                        format_seconds(time.perf_counter() - run_started),
+                        format_seconds(run_elapsed),
+                        format_seconds(average_seconds * remaining_runs),
                     )
                 except Exception as exc:
                     run_manifest.append(
@@ -229,7 +329,7 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
             write_json(run_manifest, grid_output / "run_manifest.json")
             if not combined_rows:
                 raise RuntimeError("Every grid run failed; no results can be aggregated.")
-            combined = pd.concat(combined_rows, ignore_index=True)
+            combined = pd.concat(combined_rows, ignore_index=True).copy()
             combined.to_csv(grid_output / "grid_results.csv", index=False)
 
             numeric = [
