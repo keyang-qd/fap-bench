@@ -226,3 +226,19 @@ For maximum detail inside each federated round, set `federated_client_details: t
 The current version supports shared-memory multi-process client training and reuses one
 worker pool across all federated algorithms. See [PERFORMANCE.md](PERFORMANCE.md) for
 recommended Apple-silicon settings and guidance for continuing a partial run.
+
+## Grid execution
+
+For the full multi-scenario experiment, either entry point can be used:
+
+```bash
+python -u scripts/run_grid.py --grid configs/crsp_compustat_profitability_grid.yaml
+```
+
+or:
+
+```bash
+python -u scripts/run_benchmark.py --config configs/crsp_compustat_profitability_grid.yaml
+```
+
+See `GRID_PERFORMANCE.md` for panel caching, resume behavior, parallel-client settings, and the corrected local-step compute budget.

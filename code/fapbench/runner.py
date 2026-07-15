@@ -112,7 +112,7 @@ def _model_fn(config: dict[str, Any], input_dim: int):
     )
 
 
-def _resolve_data_path(config: dict[str, Any]) -> Path:
+def resolve_data_path(config: dict[str, Any]) -> Path:
     path = Path(config["data"]["path"])
     if path.is_absolute():
         return path
@@ -620,7 +620,11 @@ def _evaluate_and_save(
     return result
 
 
-def run(config: dict[str, Any]) -> Path:
+def run(
+    config: dict[str, Any],
+    *,
+    preloaded_raw_panel: pd.DataFrame | None = None,
+) -> Path:
     seed = int(config.get("seed", 42))
     set_seed(seed)
     torch.set_num_threads(int(config.get("torch_num_threads", 1)))
@@ -640,7 +644,7 @@ def run(config: dict[str, Any]) -> Path:
     )
     run_started = time.perf_counter()
     data_cfg = config["data"]
-    data_path = _resolve_data_path(config)
+    data_path = resolve_data_path(config)
     device = config.get(
         "device", "cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -681,7 +685,15 @@ def run(config: dict[str, Any]) -> Path:
             write_json(config, output_dir / "resolved_config.json")
 
         with log_stage(logger, "Load panel"):
-            raw = load_panel(data_path)
+            if preloaded_raw_panel is None:
+                raw = load_panel(data_path)
+                panel_source = "disk"
+            else:
+                # prepare_panel() starts from frame.copy(), so the shared raw frame
+                # remains unchanged and can safely be reused by later grid runs.
+                raw = preloaded_raw_panel
+                panel_source = "grid_memory_cache"
+            logger.info("Panel source | %s", panel_source)
             log_frame(
                 logger,
                 "Raw panel",
@@ -1504,8 +1516,17 @@ def main() -> None:
             config["logging"]["level"] = args.log_level
         if args.log_file:
             config["logging"]["file"] = args.log_file
-    output = run(config)
-    print(f"Results written to {output.resolve()}")
+
+    # Support a unified CLI: when a grid YAML is passed through --config,
+    # dispatch to the grid runner instead of failing later on missing data keys.
+    if "base_config" in config and "scenarios" in config:
+        from fapbench.grid import run_grid
+
+        output = run_grid(config)
+        print(f"Grid results written to {output.resolve()}")
+    else:
+        output = run(config)
+        print(f"Results written to {output.resolve()}")
 
 
 if __name__ == "__main__":

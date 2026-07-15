@@ -1,6 +1,22 @@
 base_config: crsp_compustat_profitability.yaml
 output_dir: outputs/crsp_compustat_profitability_grid
 continue_on_error: true
+
+# Grid-level acceleration. The Parquet panel is loaded once and reused by all
+# runs. Completed scenario/seed folders are reused after interruption.
+preload_panel_once: true
+resume_completed: true
+
+# Keep one grid run active at a time. Each run already uses four parallel client
+# workers from the base config; parallelizing whole runs would oversubscribe CPU
+# and RAM on an Apple-silicon laptop.
+child_logging:
+  console: false
+  round_interval: 5
+  epoch_interval: 5
+  local_client_interval: 3
+  prediction_client_interval: 3
+
 seeds: [11, 22, 33, 44, 55]
 
 scenarios:
@@ -14,6 +30,7 @@ scenarios:
         drop_missing_domain: true
         persistent_entity: false
       federated:
+        rounds: 50
         participation_rate: 1.0
         local_epochs: 1
 
@@ -27,6 +44,7 @@ scenarios:
         drop_missing_domain: true
         persistent_entity: false
       federated:
+        rounds: 50
         participation_rate: 0.5
         local_epochs: 1
 
@@ -40,6 +58,10 @@ scenarios:
         drop_missing_domain: true
         persistent_entity: false
       federated:
+        # Hold the total local-epoch budget at 50: 10 rounds x 5 local epochs.
+        # The previous 50 x 5 setting used five times more computation and
+        # confounded local-step frequency with total optimization effort.
+        rounds: 10
         participation_rate: 1.0
         local_epochs: 5
 
@@ -51,6 +73,7 @@ scenarios:
         min_abs_price: 5.0
         exclude_bottom_market_cap_fraction: 0.0
       federated:
+        rounds: 50
         participation_rate: 1.0
         local_epochs: 1
 
@@ -65,5 +88,6 @@ scenarios:
         breakpoint_exchange_col: exchcd
         breakpoint_exchange_values: [1]
       federated:
+        rounds: 50
         participation_rate: 1.0
         local_epochs: 1
