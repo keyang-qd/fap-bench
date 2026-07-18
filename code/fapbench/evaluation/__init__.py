@@ -1,3 +1,8 @@
+from .calibration import (
+    LinearPredictionCalibrator,
+    apply_linear_prediction_calibrator,
+    fit_linear_prediction_calibrator,
+)
 from .heterogeneity import partition_heterogeneity_report
 from .portfolio import (
     calibrate_predictions_within_client,
@@ -13,6 +18,9 @@ from .predictive import (
 )
 
 __all__ = [
+    "LinearPredictionCalibrator",
+    "fit_linear_prediction_calibrator",
+    "apply_linear_prediction_calibrator",
     "predictive_metrics",
     "monthly_predictive_metrics",
     "client_predictive_metrics",

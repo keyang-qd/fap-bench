@@ -204,3 +204,109 @@ def schedule_to_frame(schedule: dict[int, Iterable[str]]) -> pd.DataFrame:
         for client in sorted(str(value) for value in schedule[round_index]):
             rows.append({"round": int(round_index + 1), "client_id": client})
     return pd.DataFrame(rows)
+
+
+def randomize_schedule_client_identity(
+    reference_schedule: dict[int, Iterable[str]],
+    all_clients: Iterable[str],
+    *,
+    seed: int,
+) -> dict[int, list[str]]:
+    """Randomize timing while preserving both sides of the schedule budget.
+
+    Degree-preserving 2x2 edge swaps keep (i) the number of active clients in
+    every round and (ii) every client's total number of selected rounds exactly
+    equal to the structured reference.  Consequently total communication and
+    aggregate client-update work are matched; only temporal identity structure
+    such as persistence or contiguous outage blocks is disrupted.
+    """
+    clients = sorted(str(value) for value in all_clients)
+    rounds = sorted(int(value) for value in reference_schedule)
+    if not clients:
+        raise ValueError("all_clients cannot be empty.")
+    if not rounds:
+        return {}
+
+    client_index = {client: index for index, client in enumerate(clients)}
+    matrix = np.zeros((len(rounds), len(clients)), dtype=np.bool_)
+    for row_index, round_index in enumerate(rounds):
+        for value in reference_schedule[round_index]:
+            client = str(value)
+            if client not in client_index:
+                raise ValueError(
+                    f"Reference schedule contains unknown client {client!r}."
+                )
+            matrix[row_index, client_index[client]] = True
+        if not matrix[row_index].any():
+            raise ValueError("Every reference round must contain at least one client.")
+
+    original_matrix = matrix.copy()
+    rng = np.random.default_rng(int(seed))
+    n_edges = int(matrix.sum())
+    target_successful_swaps = max(100, 20 * n_edges)
+    max_attempts = max(1000, 100 * target_successful_swaps)
+    successful_swaps = 0
+    attempts = 0
+    while attempts < max_attempts and successful_swaps < target_successful_swaps:
+        attempts += 1
+        r1, r2 = rng.choice(len(rounds), size=2, replace=False)
+        c1, c2 = rng.choice(len(clients), size=2, replace=False)
+        a = bool(matrix[r1, c1])
+        b = bool(matrix[r1, c2])
+        c = bool(matrix[r2, c1])
+        d = bool(matrix[r2, c2])
+        if a and not b and not c and d:
+            matrix[r1, c1] = False
+            matrix[r1, c2] = True
+            matrix[r2, c1] = True
+            matrix[r2, c2] = False
+            successful_swaps += 1
+        elif not a and b and c and not d:
+            matrix[r1, c1] = True
+            matrix[r1, c2] = False
+            matrix[r2, c1] = False
+            matrix[r2, c2] = True
+            successful_swaps += 1
+
+    if np.array_equal(matrix, original_matrix):
+        # A finite swap chain can return to its starting state.  When a valid
+        # degree-preserving swap exists, apply one deterministic final swap so
+        # the matched control actually removes temporal identity structure.
+        changed = False
+        for r1 in range(len(rounds)):
+            if changed:
+                break
+            for r2 in range(r1 + 1, len(rounds)):
+                if changed:
+                    break
+                for c1 in range(len(clients)):
+                    if changed:
+                        break
+                    for c2 in range(c1 + 1, len(clients)):
+                        a = bool(matrix[r1, c1])
+                        b = bool(matrix[r1, c2])
+                        c = bool(matrix[r2, c1])
+                        d = bool(matrix[r2, c2])
+                        if a and not b and not c and d:
+                            matrix[r1, c1] = False
+                            matrix[r1, c2] = True
+                            matrix[r2, c1] = True
+                            matrix[r2, c2] = False
+                            changed = True
+                            break
+                        if not a and b and c and not d:
+                            matrix[r1, c1] = True
+                            matrix[r1, c2] = False
+                            matrix[r2, c1] = False
+                            matrix[r2, c2] = True
+                            changed = True
+                            break
+
+    randomized: dict[int, list[str]] = {}
+    for row_index, round_index in enumerate(rounds):
+        randomized[round_index] = [
+            clients[column_index]
+            for column_index in np.flatnonzero(matrix[row_index])
+        ]
+    return randomized
+

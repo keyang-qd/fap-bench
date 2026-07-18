@@ -564,6 +564,7 @@ class FederatedTrainer:
                 local_states = [numpy_state_to_torch(result.state) for result in ordered_results]
                 local_weights = [float(result.n_rows) for result in ordered_results]
                 local_losses = [result.mean_loss for result in ordered_results]
+                local_steps = [int(result.steps) for result in ordered_results]
 
                 scaffold_deltas: list[OrderedDict[str, torch.Tensor]] = []
                 if self.algorithm == "scaffold":
@@ -607,6 +608,10 @@ class FederatedTrainer:
                     elapsed_seconds=float(round_elapsed),
                     client_update_seconds=float(client_update_seconds),
                     server_aggregation_seconds=float(aggregation_seconds),
+                    optimizer_steps_total=int(sum(local_steps)),
+                    optimizer_steps_mean=float(np.mean(local_steps)),
+                    optimizer_steps_min=int(min(local_steps)),
+                    optimizer_steps_max=int(max(local_steps)),
                     parallel_workers=int(workers if use_parallel else 1),
                 )
                 if round_end_callback is not None:

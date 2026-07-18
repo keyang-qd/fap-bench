@@ -128,6 +128,10 @@ def predictive_metrics(
             "n_ic_months": 0,
             "prediction_mean": np.nan,
             "prediction_std": np.nan,
+            "target_mean": np.nan,
+            "target_std": np.nan,
+            "calibration_intercept_ols": np.nan,
+            "calibration_slope_ols": np.nan,
         }
     y = valid[target_col].to_numpy(dtype=float)
     prediction = valid[prediction_col].to_numpy(dtype=float)
@@ -175,6 +179,20 @@ def predictive_metrics(
         "n_ic_months": int(len(valid_ic)),
         "prediction_mean": float(np.mean(prediction)),
         "prediction_std": float(np.std(prediction, ddof=0)),
+        "target_mean": float(np.mean(y)),
+        "target_std": float(np.std(y, ddof=0)),
+        "calibration_intercept_ols": float(
+            np.mean(y)
+            - (
+                np.mean((prediction - np.mean(prediction)) * (y - np.mean(y)))
+                / (np.mean((prediction - np.mean(prediction)) ** 2) + 1.0e-12)
+            )
+            * np.mean(prediction)
+        ),
+        "calibration_slope_ols": float(
+            np.mean((prediction - np.mean(prediction)) * (y - np.mean(y)))
+            / (np.mean((prediction - np.mean(prediction)) ** 2) + 1.0e-12)
+        ),
     }
 
 

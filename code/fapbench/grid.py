@@ -85,6 +85,19 @@ def _scenario_workload(base: dict[str, Any], scenario: dict[str, Any]) -> dict[s
     config = deep_update(base, scenario.get("overrides", {}))
     fed = config.get("federated", {})
     baselines = config.get("baselines", {})
+    if bool(config.get("diagnostics_only", False)):
+        return {
+            "name": str(scenario.get("name", "unnamed")),
+            "algorithms": [],
+            "rounds": 0,
+            "local_epochs": 0,
+            "participation_rate": 0.0,
+            "fl_full_client_passes": 0.0,
+            "baseline_methods": 0,
+            "baseline_epochs": 0,
+            "baseline_full_data_passes": 0.0,
+            "total_pass_equivalents": 0.0,
+        }
     algorithms = list(fed.get("algorithms", []))
     rounds = int(fed.get("rounds", 0))
     local_epochs = int(fed.get("local_epochs", 1))
@@ -132,6 +145,7 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
     if not base_path.is_absolute():
         base_path = (grid_path.parent / base_path).resolve()
     base = load_config(base_path)
+    base = deep_update(base, grid_config.get("base_overrides", {}))
 
     grid_output = ensure_dir(grid_config.get("output_dir", "outputs/grid"))
     logging_cfg = grid_config.get("logging", {})

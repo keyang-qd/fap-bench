@@ -64,6 +64,16 @@ partition:
   missing_domain_label: MissingSIC
   persistent_entity: false
 
+# Optional row-identical universe used for fair partition comparisons.
+# Keep disabled for the legacy FF12 reference; enable it through the corrected
+# partition grid so FF12, exchange, size, and IID receive exactly the same rows.
+partition_common_universe:
+  enabled: false
+  required_columns: [sic, exchcd, me]
+  finite_numeric_columns: [sic, exchcd, me]
+  positive_columns: [me]
+  ff12_sic_col: sic
+
 feature_heterogeneity:
   enabled: false
   common_fraction: 1.0
@@ -78,6 +88,12 @@ statistical_heterogeneity:
     enabled: false
     imbalance_ratio: 5.0
     min_entities_per_client: 1
+  # Uniform entity downsampling matched to the total rows produced by a
+  # requested imbalance ratio. Enable this instead of client_size_imbalance.
+  client_size_matched_control:
+    enabled: false
+    matched_imbalance_ratio: 20.0
+    min_entities_per_client: 1
   label_skew:
     enabled: false
     n_bins: 5
@@ -89,13 +105,20 @@ statistical_heterogeneity:
     log_scale_std: 0.15
 
 # Temporal stress tests use the exact same saved participation schedule for all
-# FL algorithms in a run. Modes: random (legacy), persistent, or block.
+# FL algorithms in a run. Modes: random, persistent, block, or matched_random.
+# matched_random preserves the per-round active-client counts of a structured
+# reference schedule while randomizing client identity.
 temporal_heterogeneity:
   enabled: false
   mode: persistent
   min_availability: 0.25
   max_availability: 1.0
   block_fraction: 0.35
+  matched_reference:
+    mode: persistent
+    min_availability: 0.25
+    max_availability: 1.0
+    block_fraction: 0.35
 
 model:
   hidden_dims: [64, 32]
@@ -116,6 +139,9 @@ model_selection:
   metric: rank_ic
   mode: max
   evaluate_every: 5
+  # Save the selected checkpoint's full validation metrics. This enables
+  # validation-only hyperparameter constraints such as minimum validation R2.
+  report_selected_validation_metrics: true
 
 federated:
   algorithms: [fedavg, fedprox, scaffold, fedadam]
@@ -145,6 +171,14 @@ evaluation:
   # Local models have incomparable raw score scales across clients.
   local_global_score_calibration: percentile
   report_uncalibrated_local_global: true
+  # Evaluation-only calibration fitted on validation predictions. The raw method
+  # is still reported; an additional <method>_calibrated row is emitted.
+  validation_prediction_calibration:
+    enabled: false
+    methods: [fedadam]
+    nonnegative_slope: true
+    ridge: 1.0e-12
+    method_suffix: calibrated
 
 logging:
   level: INFO

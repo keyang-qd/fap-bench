@@ -261,3 +261,213 @@ def covariate_shift_frame(
                 }
             )
     return pd.DataFrame(rows)
+
+
+
+def estimate_client_size_imbalance_rows(
+    train_frame: pd.DataFrame,
+    *,
+    entity_col: str,
+    client_col: str = "client_id",
+    imbalance_ratio: float,
+    seed: int = 42,
+    min_entities_per_client: int = 1,
+) -> int:
+    """Estimate retained rows under the exact imbalance sampler without copying rows."""
+    ratio = float(imbalance_ratio)
+    if ratio < 1.0:
+        raise ValueError("imbalance_ratio must be at least 1.0.")
+    clients = sorted(train_frame[client_col].astype(str).unique())
+    rng = np.random.default_rng(seed)
+    fractions = np.geomspace(1.0, 1.0 / ratio, num=len(clients))
+    fractions = fractions[rng.permutation(len(fractions))]
+    client_series = train_frame[client_col].astype(str)
+    retained_rows = 0
+    for client, fraction in zip(clients, fractions, strict=True):
+        group = train_frame.loc[client_series == client]
+        entities = group[entity_col].dropna().drop_duplicates().to_numpy(copy=True)
+        if len(entities) == 0:
+            raise ValueError(f"Client {client!r} has no valid entities.")
+        n_keep = max(
+            min_entities_per_client,
+            int(np.ceil(float(fraction) * len(entities))),
+        )
+        n_keep = min(len(entities), n_keep)
+        client_rng = np.random.default_rng(_stable_seed(seed, client, salt=17))
+        selected_entities = client_rng.choice(entities, size=n_keep, replace=False)
+        retained_rows += int(group[entity_col].isin(selected_entities).sum())
+    return retained_rows
+
+def apply_uniform_entity_downsampling(
+    train_frame: pd.DataFrame,
+    *,
+    entity_col: str,
+    client_col: str = "client_id",
+    retain_fraction: float,
+    seed: int = 42,
+    min_entities_per_client: int = 1,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Downsample every client by one common entity fraction.
+
+    This is the matched-sample control for client-size imbalance.  It reduces
+    total training coverage while preserving the original relative client-size
+    pattern as closely as complete entity histories permit.
+    """
+    fraction = float(retain_fraction)
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("retain_fraction must be in (0, 1].")
+    if min_entities_per_client < 1:
+        raise ValueError("min_entities_per_client must be at least 1.")
+
+    client_series = train_frame[client_col].astype(str)
+    kept_parts: list[pd.DataFrame] = []
+    rows: list[dict[str, float | int | str]] = []
+    for client in sorted(client_series.unique()):
+        group = train_frame.loc[client_series == client]
+        entities = group[entity_col].dropna().drop_duplicates().to_numpy(copy=True)
+        if len(entities) == 0:
+            raise ValueError(f"Client {client!r} has no valid entities.")
+        n_keep = max(min_entities_per_client, int(np.ceil(fraction * len(entities))))
+        n_keep = min(n_keep, len(entities))
+        rng = np.random.default_rng(_stable_seed(seed, client, salt=83))
+        selected_entities = rng.choice(entities, size=n_keep, replace=False)
+        selected = group.loc[group[entity_col].isin(selected_entities)].copy()
+        kept_parts.append(selected)
+        rows.append(
+            {
+                "client_id": client,
+                "requested_fraction": fraction,
+                "entities_before": int(len(entities)),
+                "entities_after": int(n_keep),
+                "rows_before": int(len(group)),
+                "rows_after": int(len(selected)),
+                "realized_fraction": float(len(selected) / len(group)),
+            }
+        )
+    result = pd.concat(kept_parts, ignore_index=True)
+    return result, pd.DataFrame(rows).sort_values("client_id").reset_index(drop=True)
+
+
+def apply_size_matched_uniform_control(
+    train_frame: pd.DataFrame,
+    *,
+    entity_col: str,
+    client_col: str = "client_id",
+    matched_imbalance_ratio: float,
+    seed: int = 42,
+    min_entities_per_client: int = 1,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | int]]:
+    """Create a uniform-downsampling control matched to an imbalance stress test.
+
+    The target retained fraction is estimated using the exact same seed and
+    requested imbalance ratio, but the returned sample applies one common
+    retention fraction to every client.  Complete entity histories remain intact.
+    """
+    target_rows = estimate_client_size_imbalance_rows(
+        train_frame,
+        entity_col=entity_col,
+        client_col=client_col,
+        imbalance_ratio=matched_imbalance_ratio,
+        seed=seed,
+        min_entities_per_client=min_entities_per_client,
+    )
+    target_fraction = float(target_rows / len(train_frame))
+    controlled, report = apply_uniform_entity_downsampling(
+        train_frame,
+        entity_col=entity_col,
+        client_col=client_col,
+        retain_fraction=target_fraction,
+        seed=seed,
+        min_entities_per_client=min_entities_per_client,
+    )
+    metadata: dict[str, float | int] = {
+        "matched_imbalance_ratio": float(matched_imbalance_ratio),
+        "target_rows_from_imbalance": target_rows,
+        "target_retained_fraction": target_fraction,
+        "realized_rows": int(len(controlled)),
+        "realized_retained_fraction": float(len(controlled) / len(train_frame)),
+        "row_match_error": int(len(controlled) - target_rows),
+    }
+    return controlled, report, metadata
+
+
+def regression_label_diagnostics(
+    frame: pd.DataFrame,
+    *,
+    target_col: str,
+    date_col: str,
+    client_col: str = "client_id",
+    entity_col: str | None = None,
+    stage: str,
+    lower_tail_threshold: float | None = None,
+    upper_tail_threshold: float | None = None,
+    n_bins: int = 5,
+    bin_edges: Iterable[float] | None = None,
+) -> pd.DataFrame:
+    """Summarize why a label-skew sample may become easier or harder.
+
+    Diagnostics include target dispersion, fixed-tail shares, monthly sample
+    breadth, and an effective number of occupied target bins.  The overall row is
+    followed by client-specific rows.
+    """
+    target = pd.to_numeric(frame[target_col], errors="coerce")
+    finite = target.replace([np.inf, -np.inf], np.nan).dropna()
+    if finite.empty:
+        return pd.DataFrame()
+    if lower_tail_threshold is None:
+        lower_tail_threshold = float(finite.quantile(0.05))
+    if upper_tail_threshold is None:
+        upper_tail_threshold = float(finite.quantile(0.95))
+
+    if bin_edges is None:
+        _, edges = pd.qcut(finite, q=n_bins, retbins=True, duplicates="drop")
+        edges = np.unique(np.asarray(edges, dtype=float))
+    else:
+        edges = np.unique(np.asarray(list(bin_edges), dtype=float))
+    if len(edges) >= 3:
+        edges[0], edges[-1] = -np.inf, np.inf
+
+    def summarize(group: pd.DataFrame, label: str) -> dict[str, float | int | str]:
+        y = pd.to_numeric(group[target_col], errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna()
+        monthly = group.groupby(date_col, observed=True).size()
+        if len(edges) >= 3 and not y.empty:
+            bins = pd.cut(y, bins=edges, labels=False, include_lowest=True)
+            shares = bins.value_counts(normalize=True)
+            hhi = float(np.square(shares.to_numpy(dtype=float)).sum())
+            effective_bins = float(1.0 / hhi) if hhi > 0 else float("nan")
+        else:
+            effective_bins = float("nan")
+        return {
+            "stage": stage,
+            "scope": label,
+            "rows": int(len(group)),
+            "entities": int(group[entity_col].nunique())
+            if entity_col is not None and entity_col in group.columns
+            else 0,
+            "months": int(group[date_col].nunique()),
+            "target_mean": float(y.mean()),
+            "target_std": float(y.std(ddof=0)),
+            "target_q01": float(y.quantile(0.01)),
+            "target_q05": float(y.quantile(0.05)),
+            "target_q50": float(y.quantile(0.50)),
+            "target_q95": float(y.quantile(0.95)),
+            "target_q99": float(y.quantile(0.99)),
+            "lower_tail_share": float((y <= lower_tail_threshold).mean()),
+            "upper_tail_share": float((y >= upper_tail_threshold).mean()),
+            "two_sided_tail_share": float(
+                ((y <= lower_tail_threshold) | (y >= upper_tail_threshold)).mean()
+            ),
+            "monthly_rows_mean": float(monthly.mean()),
+            "monthly_rows_min": int(monthly.min()),
+            "monthly_rows_max": int(monthly.max()),
+            "effective_target_bins": effective_bins,
+            "lower_tail_threshold": float(lower_tail_threshold),
+            "upper_tail_threshold": float(upper_tail_threshold),
+        }
+
+    rows = [summarize(frame, "ALL")]
+    for client, group in frame.groupby(client_col, sort=True, observed=True):
+        rows.append(summarize(group, str(client)))
+    return pd.DataFrame(rows)

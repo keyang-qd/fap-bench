@@ -28,10 +28,12 @@ from fapbench.data import (
     validate_crsp_compustat_profitability_panel,
 )
 from fapbench.evaluation import (
+    apply_linear_prediction_calibrator,
     calibrate_predictions_within_client,
     client_averaged_long_short_metrics,
     client_portfolio_metrics,
     client_predictive_metrics,
+    fit_linear_prediction_calibrator,
     long_short_client_exposures,
     long_short_portfolio_metrics,
     monthly_predictive_metrics,
@@ -44,6 +46,8 @@ from fapbench.partition import (
     ClientSampler,
     add_ff12_column,
     apply_client_size_imbalance,
+    apply_partition_common_universe,
+    apply_size_matched_uniform_control,
     apply_covariate_shift,
     apply_feature_masks_to_frame,
     apply_regression_label_skew,
@@ -52,6 +56,8 @@ from fapbench.partition import (
     build_covariate_shift_parameters,
     build_feature_masks,
     covariate_shift_frame,
+    randomize_schedule_client_identity,
+    regression_label_diagnostics,
     schedule_to_frame,
     temporal_availability_report,
     temporal_unavailability,
@@ -810,6 +816,34 @@ def run(
             split_counts = panel["split"].value_counts(dropna=False).to_dict()
             logger.info("Split counts | %s", " | ".join(f"{k}={v:,}" for k, v in split_counts.items()))
 
+        common_universe_cfg = config.get("partition_common_universe", {})
+        common_universe_report: dict[str, Any] = {"enabled": False}
+        if bool(common_universe_cfg.get("enabled", False)):
+            with log_stage(logger, "Apply partition common universe"):
+                panel, common_universe_report = apply_partition_common_universe(
+                    panel,
+                    required_columns=common_universe_cfg.get(
+                        "required_columns", ["sic", "exchcd", "me"]
+                    ),
+                    finite_numeric_columns=common_universe_cfg.get(
+                        "finite_numeric_columns", ["sic", "exchcd", "me"]
+                    ),
+                    positive_columns=common_universe_cfg.get(
+                        "positive_columns", ["me"]
+                    ),
+                    ff12_sic_col=common_universe_cfg.get("ff12_sic_col", "sic"),
+                )
+                write_json(
+                    common_universe_report,
+                    output_dir / "partition_common_universe.json",
+                )
+                logger.info(
+                    "Partition common universe | rows_before=%s | rows_after=%s | retained=%.4f",
+                    f"{common_universe_report['n_rows_before']:,}",
+                    f"{common_universe_report['n_rows_after']:,}",
+                    common_universe_report["retained_fraction"],
+                )
+
         with log_stage(logger, "Preprocess features"):
             preprocessor = PanelPreprocessor(
                 features, scaling=data_cfg.get("scaling", "global")
@@ -871,6 +905,12 @@ def run(
                     ),
                     fit_split_col="split",
                     fit_split_value="train",
+                    missing_policy=str(
+                        partition_cfg.get(
+                            "missing_policy",
+                            "drop" if bool(partition_cfg.get("drop_missing_domain", False)) else "separate",
+                        )
+                    ),
                 )
             else:
                 raise ValueError("partition.type must be iid or domain.")
@@ -890,7 +930,49 @@ def run(
         statistical_report: dict[str, Any] = {"enabled": False}
         if bool(statistical_cfg.get("enabled", False)):
             statistical_report = {"enabled": True}
+            matched_size_cfg = statistical_cfg.get("client_size_matched_control", {})
             size_cfg = statistical_cfg.get("client_size_imbalance", {})
+            if bool(matched_size_cfg.get("enabled", False)) and bool(
+                size_cfg.get("enabled", False)
+            ):
+                raise ValueError(
+                    "Enable either client_size_matched_control or "
+                    "client_size_imbalance, not both."
+                )
+            if bool(matched_size_cfg.get("enabled", False)):
+                with log_stage(logger, "Apply matched uniform client-size control"):
+                    rows_before = len(train)
+                    train, size_report, matched_metadata = (
+                        apply_size_matched_uniform_control(
+                            train,
+                            entity_col=spec.entity_col,
+                            client_col="client_id",
+                            matched_imbalance_ratio=float(
+                                matched_size_cfg.get("matched_imbalance_ratio", 20.0)
+                            ),
+                            seed=seed,
+                            min_entities_per_client=int(
+                                matched_size_cfg.get("min_entities_per_client", 1)
+                            ),
+                        )
+                    )
+                    size_report.to_csv(
+                        output_dir / "client_size_matched_control.csv", index=False
+                    )
+                    statistical_report.update(
+                        {
+                            "client_size_matched_control_enabled": True,
+                            "client_size_matched_ratio": float(
+                                matched_size_cfg.get("matched_imbalance_ratio", 20.0)
+                            ),
+                            "client_size_rows_before": int(rows_before),
+                            "client_size_rows_after": int(len(train)),
+                            "client_size_retained_fraction": float(
+                                len(train) / rows_before
+                            ),
+                            **matched_metadata,
+                        }
+                    )
             if bool(size_cfg.get("enabled", False)):
                 with log_stage(logger, "Apply client-size imbalance"):
                     rows_before = len(train)
@@ -924,6 +1006,29 @@ def run(
             if bool(label_cfg.get("enabled", False)):
                 with log_stage(logger, "Apply regression-label skew"):
                     rows_before = len(train)
+                    finite_target = pd.to_numeric(
+                        train[spec.target_col], errors="coerce"
+                    ).replace([np.inf, -np.inf], np.nan).dropna()
+                    lower_tail = float(finite_target.quantile(0.05))
+                    upper_tail = float(finite_target.quantile(0.95))
+                    _, diagnostic_bin_edges = pd.qcut(
+                        finite_target,
+                        q=int(label_cfg.get("n_bins", 5)),
+                        retbins=True,
+                        duplicates="drop",
+                    )
+                    diagnostics_before = regression_label_diagnostics(
+                        train,
+                        target_col=spec.target_col,
+                        date_col=split_date_col,
+                        client_col="client_id",
+                        entity_col=spec.entity_col,
+                        stage="before",
+                        lower_tail_threshold=lower_tail,
+                        upper_tail_threshold=upper_tail,
+                        n_bins=int(label_cfg.get("n_bins", 5)),
+                        bin_edges=diagnostic_bin_edges,
+                    )
                     train, label_report = apply_regression_label_skew(
                         train,
                         target_col=spec.target_col,
@@ -932,6 +1037,23 @@ def run(
                         concentration=float(label_cfg.get("concentration", 1.0)),
                         retain_fraction=float(label_cfg.get("retain_fraction", 0.7)),
                         seed=seed,
+                    )
+                    diagnostics_after = regression_label_diagnostics(
+                        train,
+                        target_col=spec.target_col,
+                        date_col=split_date_col,
+                        client_col="client_id",
+                        entity_col=spec.entity_col,
+                        stage="after",
+                        lower_tail_threshold=lower_tail,
+                        upper_tail_threshold=upper_tail,
+                        n_bins=int(label_cfg.get("n_bins", 5)),
+                        bin_edges=diagnostic_bin_edges,
+                    )
+                    pd.concat(
+                        [diagnostics_before, diagnostics_after], ignore_index=True
+                    ).to_csv(
+                        output_dir / "label_skew_diagnostics.csv", index=False
                     )
                     label_report.to_csv(
                         output_dir / "label_skew.csv", index=False
@@ -950,6 +1072,8 @@ def run(
                             "label_skew_retained_fraction": float(
                                 len(train) / rows_before
                             ),
+                            "label_skew_lower_tail_threshold": lower_tail,
+                            "label_skew_upper_tail_threshold": upper_tail,
                         }
                     )
 
@@ -1046,17 +1170,69 @@ def run(
             if temporal_enabled
             else "random"
         )
-        sampler = ClientSampler(
-            clients,
-            participation_rate,
-            seed,
-            mode=temporal_mode,
-            total_rounds=rounds,
-            min_availability=float(temporal_cfg.get("min_availability", 0.25)),
-            max_availability=float(temporal_cfg.get("max_availability", 1.0)),
-            block_fraction=float(temporal_cfg.get("block_fraction", 0.35)),
-        )
-        schedule = sampler.schedule(rounds)
+        reference_schedule = None
+        if temporal_mode == "matched_random":
+            reference_cfg = temporal_cfg.get("matched_reference", {})
+            reference_mode = str(reference_cfg.get("mode", "persistent")).lower()
+            reference_sampler = ClientSampler(
+                clients,
+                participation_rate,
+                seed,
+                mode=reference_mode,
+                total_rounds=rounds,
+                min_availability=float(
+                    reference_cfg.get(
+                        "min_availability", temporal_cfg.get("min_availability", 0.25)
+                    )
+                ),
+                max_availability=float(
+                    reference_cfg.get(
+                        "max_availability", temporal_cfg.get("max_availability", 1.0)
+                    )
+                ),
+                block_fraction=float(
+                    reference_cfg.get(
+                        "block_fraction", temporal_cfg.get("block_fraction", 0.35)
+                    )
+                ),
+            )
+            reference_schedule = reference_sampler.schedule(rounds)
+            schedule = randomize_schedule_client_identity(
+                reference_schedule, clients, seed=seed + 991
+            )
+            if schedule == reference_schedule:
+                raise ValueError(
+                    "The matched-random schedule could not alter temporal client "
+                    "identity while preserving round and client totals."
+                )
+            schedule_to_frame(reference_schedule).to_csv(
+                output_dir / "matched_reference_participation_schedule.csv",
+                index=False,
+            )
+            expected_availability = {
+                client: float(
+                    np.mean(
+                        [
+                            client in set(map(str, active))
+                            for active in reference_schedule.values()
+                        ]
+                    )
+                )
+                for client in clients
+            }
+        else:
+            sampler = ClientSampler(
+                clients,
+                participation_rate,
+                seed,
+                mode=temporal_mode,
+                total_rounds=rounds,
+                min_availability=float(temporal_cfg.get("min_availability", 0.25)),
+                max_availability=float(temporal_cfg.get("max_availability", 1.0)),
+                block_fraction=float(temporal_cfg.get("block_fraction", 0.35)),
+            )
+            schedule = sampler.schedule(rounds)
+            expected_availability = sampler.availability_probabilities()
         effective_participation_rate = float(
             np.mean([len(active) / len(clients) for active in schedule.values()])
         )
@@ -1068,7 +1244,6 @@ def run(
         client_availability, temporal_summary = temporal_availability_report(
             schedule, clients
         )
-        expected_availability = sampler.availability_probabilities()
         client_availability["expected_availability"] = client_availability[
             "client_id"
         ].map(expected_availability)
@@ -1087,11 +1262,23 @@ def run(
             )
             heterogeneity.update(temporal_summary)
             heterogeneity["temporal_mode"] = temporal_mode
+            if reference_schedule is not None:
+                heterogeneity["temporal_matched_reference_mode"] = str(
+                    temporal_cfg.get("matched_reference", {}).get(
+                        "mode", "persistent"
+                    )
+                )
+                heterogeneity["temporal_matched_active_slots"] = int(
+                    sum(len(active) for active in reference_schedule.values())
+                )
             heterogeneity["feature_columns"] = features
             heterogeneity["split_date_col"] = split_date_col
             for key, value in statistical_report.items():
                 if isinstance(value, (int, float, bool, str)):
                     heterogeneity[f"controlled_{key}"] = value
+            for key, value in common_universe_report.items():
+                if isinstance(value, (int, float, bool, str)):
+                    heterogeneity[f"common_universe_{key}"] = value
             write_json(heterogeneity, output_dir / "heterogeneity.json")
             numeric_h = {
                 key: value
@@ -1122,6 +1309,42 @@ def run(
                 mask_frame = pd.DataFrame(feature_masks, index=features).T
                 mask_frame.index.name = "client_id"
                 mask_frame.to_csv(output_dir / "feature_masks.csv")
+
+        if bool(config.get("diagnostics_only", False)):
+            diagnostics_result = pd.DataFrame(
+                [
+                    {
+                        "method": "diagnostics_only",
+                        "diagnostics_only": True,
+                        "training_skipped": True,
+                    }
+                ]
+            )
+            diagnostics_result.to_csv(
+                output_dir / "benchmark_results.csv", index=False
+            )
+            elapsed_seconds = float(time.perf_counter() - run_started)
+            run_metadata.update(
+                {
+                    "status": "completed",
+                    "elapsed_seconds": elapsed_seconds,
+                    "methods": ["diagnostics_only"],
+                    "n_clients": len(clients),
+                    "n_features": len(features),
+                    "train_rows": int(len(train)),
+                    "validation_rows": int(len(val)),
+                    "test_rows": int(len(test)),
+                    "diagnostics_only": True,
+                    "process_peak_rss_mb": process_peak_rss_mb(),
+                }
+            )
+            write_json(run_metadata, output_dir / "run_metadata.json")
+            logger.info(
+                "Diagnostics-only run complete | output=%s | elapsed=%s",
+                output_dir.resolve(),
+                format_seconds(elapsed_seconds),
+            )
+            return output_dir
 
         model_fn = _model_fn(config, len(features))
         checkpoint_dir = ensure_dir(output_dir / "checkpoints")
@@ -1467,6 +1690,27 @@ def run(
             sum(item.nbytes for item in federated_client_arrays.values()) / 1024**2,
             format_seconds(time.perf_counter() - cache_started),
         )
+        configured_batch_size = int(fed_cfg.get("batch_size", 512))
+        client_budget = pd.DataFrame(
+            [
+                {
+                    "client_id": client_id,
+                    "n_rows": arrays.n_rows,
+                    "batch_size": min(configured_batch_size, arrays.n_rows),
+                    "batches_per_local_epoch": int(
+                        np.ceil(arrays.n_rows / configured_batch_size)
+                    ),
+                    "optimizer_steps_per_selected_round": int(
+                        np.ceil(arrays.n_rows / configured_batch_size)
+                    )
+                    * local_epochs,
+                }
+                for client_id, arrays in federated_client_arrays.items()
+            ]
+        ).sort_values("client_id")
+        client_budget.to_csv(
+            output_dir / "client_training_budget.csv", index=False
+        )
         if parallel_client_count > 1 and torch.device(device).type == "cpu":
             runtime_context = ParallelClientRuntime(
                 federated_client_arrays,
@@ -1568,6 +1812,44 @@ def run(
                     training_history.to_csv(
                         output_dir / f"training_{algorithm}.csv", index=False
                     )
+                    calibration_cfg = config.get("evaluation", {}).get(
+                        "validation_prediction_calibration", {}
+                    )
+                    calibration_methods = {
+                        str(value).lower()
+                        for value in calibration_cfg.get("methods", ["fedadam"])
+                    }
+                    report_selected_validation = bool(
+                        config.get("model_selection", {}).get(
+                            "report_selected_validation_metrics", True
+                        )
+                    )
+                    needs_calibration_validation = bool(
+                        calibration_cfg.get("enabled", False)
+                    ) and algorithm.lower() in calibration_methods
+                    validation_predictions = None
+                    if not val.empty and (
+                        report_selected_validation or needs_calibration_validation
+                    ):
+                        validation_predictions = _prediction_frame(
+                            model,
+                            val,
+                            features,
+                            spec.target_col,
+                            spec.date_col,
+                            spec.entity_col,
+                            "client_id",
+                            device,
+                            feature_masks,
+                            target_date_col=spec.target_date_col,
+                            logger=logger,
+                            log_name=f"{algorithm} selected validation prediction",
+                            client_log_interval=prediction_client_log_interval,
+                        )
+                        validation_predictions.to_parquet(
+                            output_dir / f"validation_predictions_{algorithm}.parquet",
+                            index=False,
+                        )
                     prediction_started = time.perf_counter()
                     predictions = _prediction_frame(
                         model,
@@ -1588,6 +1870,19 @@ def run(
                     metrics = _evaluate_and_save(
                         algorithm, predictions, output_dir, config, logger
                     )
+                    if validation_predictions is not None:
+                        validation_date = _evaluation_date_col(
+                            validation_predictions, config
+                        )
+                        metrics.update(
+                            _prefix_metrics(
+                                "validation_selected_",
+                                predictive_metrics(
+                                    validation_predictions,
+                                    date_col=validation_date,
+                                ),
+                            )
+                        )
                     metrics["training_elapsed_seconds"] = float(training_elapsed)
                     metrics["prediction_elapsed_seconds"] = float(prediction_elapsed)
                     metrics["training_rounds"] = rounds
@@ -1620,6 +1915,28 @@ def run(
                     metrics["server_aggregation_elapsed_seconds"] = float(
                         training_history["server_aggregation_seconds"].sum()
                     )
+                    if "optimizer_steps_total" in training_history.columns:
+                        metrics["optimizer_steps_total"] = int(
+                            training_history["optimizer_steps_total"].sum()
+                        )
+                        metrics["optimizer_steps_per_round_mean"] = float(
+                            training_history["optimizer_steps_total"].mean()
+                        )
+                        metrics["optimizer_steps_per_round_min"] = int(
+                            training_history["optimizer_steps_total"].min()
+                        )
+                        metrics["optimizer_steps_per_round_max"] = int(
+                            training_history["optimizer_steps_total"].max()
+                        )
+                        metrics["selected_client_steps_mean"] = float(
+                            training_history["optimizer_steps_mean"].mean()
+                        )
+                        metrics["selected_client_steps_min"] = int(
+                            training_history["optimizer_steps_min"].min()
+                        )
+                        metrics["selected_client_steps_max"] = int(
+                            training_history["optimizer_steps_max"].max()
+                        )
                     if selector is not None:
                         metrics.update(selector.metadata())
                         if selector.best_step is not None:
@@ -1642,6 +1959,91 @@ def run(
                     metrics["process_peak_rss_mb"] = process_peak_rss_mb()
                     write_json(metrics, output_dir / f"metrics_{algorithm}.json")
                     results.append({"method": algorithm, **metrics})
+
+                    if bool(calibration_cfg.get("enabled", False)) and (
+                        algorithm.lower() in calibration_methods
+                    ):
+                        if validation_predictions is None:
+                            raise ValueError(
+                                "Validation prediction calibration requires a "
+                                "non-empty validation split."
+                            )
+                        calibration_started = time.perf_counter()
+                        calibrator = fit_linear_prediction_calibrator(
+                            validation_predictions,
+                            nonnegative_slope=bool(
+                                calibration_cfg.get("nonnegative_slope", True)
+                            ),
+                            ridge=float(calibration_cfg.get("ridge", 1.0e-12)),
+                        )
+                        calibrated_predictions = apply_linear_prediction_calibrator(
+                            predictions, calibrator
+                        )
+                        suffix = str(calibration_cfg.get("method_suffix", "calibrated"))
+                        calibrated_name = f"{algorithm}_{suffix}"
+                        calibrated_metrics = _evaluate_and_save(
+                            calibrated_name,
+                            calibrated_predictions,
+                            output_dir,
+                            config,
+                            logger,
+                        )
+                        shared_metadata_keys = [
+                            key
+                            for key in metrics
+                            if key.startswith("training_")
+                            or key.startswith("communicated_")
+                            or key.startswith("optimizer_")
+                            or key.startswith("selected_client_steps_")
+                            or key.startswith("selected_")
+                            or key.startswith("validation_")
+                            or key in {
+                                "selection_metric",
+                                "selection_mode",
+                                "client_update_elapsed_seconds",
+                                "server_aggregation_elapsed_seconds",
+                                "process_peak_rss_mb",
+                            }
+                        ]
+                        for key in shared_metadata_keys:
+                            calibrated_metrics[key] = metrics[key]
+                        calibrated_metrics.update(
+                            {
+                                "evaluation_only_variant_of": algorithm,
+                                "prediction_calibration_method": "validation_linear",
+                                "prediction_calibration_fitted_on": "validation",
+                                "prediction_calibration_intercept": calibrator.intercept,
+                                "prediction_calibration_slope": calibrator.slope,
+                                "prediction_calibration_raw_slope": calibrator.raw_slope,
+                                "prediction_calibration_direction_valid": (
+                                    calibrator.direction_valid
+                                ),
+                                "prediction_calibration_n_obs": calibrator.n_obs,
+                                "prediction_calibration_nonnegative_slope": (
+                                    calibrator.nonnegative_slope
+                                ),
+                                "prediction_elapsed_seconds": float(
+                                    prediction_elapsed
+                                    + time.perf_counter()
+                                    - calibration_started
+                                ),
+                                "method_elapsed_seconds": float(
+                                    time.perf_counter() - method_started
+                                ),
+                                "process_peak_rss_mb": process_peak_rss_mb(),
+                            }
+                        )
+                        write_json(
+                            calibrator.to_dict(),
+                            output_dir / f"prediction_calibration_{algorithm}.json",
+                        )
+                        write_json(
+                            calibrated_metrics,
+                            output_dir / f"metrics_{calibrated_name}.json",
+                        )
+                        results.append(
+                            {"method": calibrated_name, **calibrated_metrics}
+                        )
         with log_stage(logger, "Save benchmark summary"):
             results_frame = pd.DataFrame(results)
             results_frame.to_csv(

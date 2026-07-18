@@ -1,0 +1,39 @@
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/crsp_compustat_profitability_label_diagnostic_grid
+continue_on_error: true
+preload_panel_once: true
+resume_completed: true
+
+base_overrides:
+  diagnostics_only: true
+
+# Five seeds are retained because the Dirichlet preferences are seed-specific,
+# but no model is trained; this grid only builds and audits the skewed samples.
+seeds: [11, 22, 33, 44, 55]
+
+scenarios:
+  - name: label_skew_mild_diagnostics
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance: {enabled: false}
+        client_size_matched_control: {enabled: false}
+        label_skew:
+          enabled: true
+          n_bins: 5
+          concentration: 2.0
+          retain_fraction: 0.6
+        covariate_shift: {enabled: false}
+
+  - name: label_skew_strong_diagnostics
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance: {enabled: false}
+        client_size_matched_control: {enabled: false}
+        label_skew:
+          enabled: true
+          n_bins: 5
+          concentration: 0.2
+          retain_fraction: 0.6
+        covariate_shift: {enabled: false}

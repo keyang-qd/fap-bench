@@ -70,3 +70,9 @@ The domain benchmark uses the client-neutral portfolio as the primary result.
 
 The full CRSP--Compustat experiment was not rerun in this environment because the
 configured financial dataset path is local to the user's machine.
+
+## 0.5.1 IID partition hotfix
+
+- Fixed `partition_iid_12` failures on Arrow/Parquet-backed read-only arrays.
+- Replaced in-place `rng.shuffle` with an owned entity array and `rng.permutation`.
+- Added regression tests for read-only arrays, deterministic assignment, and input immutability.

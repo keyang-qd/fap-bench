@@ -17,6 +17,35 @@ def test_iid_keeps_entity_history_together():
     assert assigned["client_id"].nunique() == 3
 
 
+def test_iid_accepts_read_only_entity_array(monkeypatch):
+    """Parquet/Arrow-backed columns may expose read-only NumPy views."""
+    frame = pd.DataFrame({"permno": np.repeat(np.arange(12), 2), "value": 1.0})
+    original_to_numpy = pd.Series.to_numpy
+
+    def readonly_to_numpy(series, *args, **kwargs):
+        values = original_to_numpy(series, *args, **kwargs)
+        values = np.asarray(values).copy()
+        values.setflags(write=False)
+        return values
+
+    monkeypatch.setattr(pd.Series, "to_numpy", readonly_to_numpy)
+    assigned = assign_iid_clients(frame, "permno", num_clients=3, seed=7)
+
+    assert assigned.groupby("permno")["client_id"].nunique().max() == 1
+    assert assigned["client_id"].nunique() == 3
+
+
+def test_iid_assignment_is_deterministic_without_mutating_input():
+    frame = pd.DataFrame({"permno": np.repeat(np.arange(12), 2), "value": 1.0})
+    original = frame.copy(deep=True)
+
+    first = assign_iid_clients(frame, "permno", num_clients=3, seed=9)
+    second = assign_iid_clients(frame, "permno", num_clients=3, seed=9)
+
+    pd.testing.assert_frame_equal(frame, original)
+    pd.testing.assert_series_equal(first["client_id"], second["client_id"])
+
+
 def test_domain_and_masks():
     frame = pd.DataFrame({"sector": [10, 10, 20, 20], "x": [1, 2, 3, 4]})
     assigned = assign_domain_clients(frame, "sector")

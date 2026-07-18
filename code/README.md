@@ -51,18 +51,30 @@ source-of-truth for what can be run without adding new benchmark logic.
 | `scripts/run_benchmark.py` + any single-run YAML | Centralized oracle, masked centralized reference, local-only models, FedAvg, FedProx, SCAFFOLD, and FedAdam; validation checkpoint selection; predictive, portfolio, client-level, communication, timing, and peak-memory metrics | One complete run directory with checkpoints, predictions, metrics, schedules, and logs |
 | `configs/crsp_compustat_profitability_grid.yaml` | Core five-seed grid: FF12 full participation, 50% random participation, communication-efficient 10-round/5-local-epoch training, price above $5, and NYSE-breakpoint microcap exclusion | `grid_results.csv`, `grid_summary.csv`, and per-cell outputs |
 | `configs/crsp_compustat_profitability_heterogeneity_grid.yaml` | Controlled client-size imbalance; continuous-label skew; client-specific covariate shift; persistent heterogeneous availability; block outages; mild/moderate/severe feature-space heterogeneity | Realized perturbation files plus multi-seed method comparisons |
-| `configs/crsp_compustat_profitability_partition_grid.yaml` | Alternative client definitions: FF12 industries, exchange, training-fitted market-cap quintiles, and 12-client IID entity partition | Partition-comparison grid and saved assignments |
+| `configs/crsp_compustat_profitability_partition_grid.yaml` | Legacy exploratory partition grid. It reproduces the completed results but does not force a common stock universe across partitions. | Legacy partition-comparison outputs |
+| `configs/crsp_compustat_profitability_partition_common_grid.yaml` | Corrected row-identical partition comparison: FF12, exchange, exactly five market-cap quintiles, and IID-12 on the same firm-month universe | Common-universe report/fingerprint, five-client size partition, and comparable method results |
+| `configs/crsp_compustat_profitability_identification_grid.yaml` | Matched-sample controls for 5:1 and 20:1 client-size imbalance; matched-random controls for persistent and block temporal outages | Identification-focused contrasts with equalized data coverage or per-round participation counts |
+| `configs/crsp_compustat_profitability_label_diagnostic_grid.yaml` | Diagnostics-only mild/strong label-skew reconstruction across five seeds; no model training | Target dispersion, fixed-tail shares, monthly breadth, effective target bins, and client bin shares |
+| `configs/crsp_compustat_profitability_fedadam_validation_grid.yaml` | Four FedAdam server learning rates with full selected-checkpoint validation Rank IC/OOS R2 and validation-fitted scale calibration | Validation-only constrained model selection plus raw/calibrated test diagnostics |
+| `configs/crsp_compustat_profitability_calibration_grid.yaml` | FedAdam at server LR 0.003 and 0.01 with a linear prediction calibrator fitted only on validation predictions | Raw and `<method>_calibrated` rows, validation predictions, and calibration coefficients |
 | `configs/crsp_compustat_profitability_hyperparameter_grid.yaml` | FedProx proximal coefficient sweep and FedAdam server-learning-rate sweep; repeated baselines are disabled to reduce runtime | Multi-seed sensitivity results for the selected FL algorithm |
 | `scripts/run_grid.py` | Resumable multi-scenario and multi-seed execution; optional process-level parallel grid cells plus client-level parallel training inside each cell | Grid manifest, aggregate results, and persistent logs |
 | `scripts/benchmark_parallel_speed.py` | Serial-versus-parallel client-training timing check | Runtime comparison for choosing `parallel_clients` |
+| `scripts/run_iid_sanity.py` | Exact one-step IID sanity check: full-batch FedAvg must match centralized full-batch SGD | JSON pass/fail report and maximum parameter difference |
+| `scripts/select_hyperparameters.py` | Freezes a scenario using only a `validation_*` metric; rejects test-based selection fields | Validation-only selection manifest and optional frozen YAML override |
+| `scripts/validate_identification_outputs.py` | Verifies common-universe fingerprints, exactly five size clients, matched row counts, matched per-round participation counts, and matched per-client totals | Machine-readable pass/fail audit before analysis |
 | `scripts/analyze_results.py` | Paired return comparisons, Newey--West tests, and moving-block-bootstrap Sharpe intervals for completed methods | Statistical comparison tables |
 | `scripts/plot_results.py` | Plots from completed benchmark/grid result files | Publication-oriented figures |
+| `scripts/plot_tradeoffs.py` | Communication-vs-Rank-IC and training-time-vs-client-neutral-Sharpe diagrams | Pareto-style system/economic trade-off figures and CSV summaries |
 | `scripts/make_synthetic.py` + synthetic configs | Small synthetic smoke tests for all main training paths | Fast test panel and benchmark outputs |
 | `scripts/inspect_data.py` | Panel schema, coverage, date, entity, and missingness inspection | Data diagnostics |
 | `scripts/repair_completed_run.py` | Rebuilds summary artifacts for a completed run when aggregation was interrupted | Repaired result files without retraining |
 | `scripts/data_recipe2_revised.py` | CRSP--Compustat profitability panel construction, delisting-return adjustment, exact next-month targets, SIC retention, and profitability features | Aligned Parquet research panel |
 
-The controlled statistical experiments are explicit stress tests. Client-size
+The controlled statistical experiments are explicit stress tests. Setting
+`diagnostics_only: true` executes data preparation, partitioning, perturbations,
+and artifact generation without training any model. This is used by the fast
+label-skew diagnostic grid. Client-size
 imbalance keeps complete security histories but subsamples training entities;
 label skew uses training-only target-quantile weighted subsampling with a fixed
 retention fraction; covariate shift applies the same seeded client-specific affine
@@ -80,16 +92,105 @@ python -u scripts/run_grid.py \
 python -u scripts/run_grid.py \
   --grid configs/crsp_compustat_profitability_heterogeneity_grid.yaml
 
-# Alternative financial client partitions
+# Corrected, row-identical financial client partitions
 python -u scripts/run_grid.py \
-  --grid configs/crsp_compustat_profitability_partition_grid.yaml
+  --grid configs/crsp_compustat_profitability_partition_common_grid.yaml
 
-# FedProx and FedAdam sensitivity
+# Matched controls that isolate sample loss and temporal pattern effects
+python -u scripts/run_grid.py \
+  --grid configs/crsp_compustat_profitability_identification_grid.yaml
+
+# Fast diagnostics-only investigation of non-monotonic label skew
+python -u scripts/run_grid.py \
+  --grid configs/crsp_compustat_profitability_label_diagnostic_grid.yaml
+
+# Validation-only FedAdam hyperparameter selection inputs
+python -u scripts/run_grid.py \
+  --grid configs/crsp_compustat_profitability_fedadam_validation_grid.yaml
+
+# Optional focused calibration rerun for LR 0.003 and 0.01
+python -u scripts/run_grid.py \
+  --grid configs/crsp_compustat_profitability_calibration_grid.yaml
+
+# Original FedProx and FedAdam test sensitivity table
 python -u scripts/run_grid.py \
   --grid configs/crsp_compustat_profitability_hyperparameter_grid.yaml
 ```
 
-### Parallel execution
+## Identification-corrected experiments
+
+The publication-facing partition comparison is now
+`crsp_compustat_profitability_partition_common_grid.yaml`, not the legacy
+partition grid. It applies one pre-partition filter requiring valid SIC, exchange,
+and positive market equity. Every cell saves `partition_common_universe.json` with
+the same row count and SHA-256 row fingerprint. Market-cap quantiles use
+`missing_policy: error`, so the size experiment contains exactly five clients.
+
+The identification grid separates two previously confounded effects:
+
+- `size_uniform_matched_ratio_*` uses one common entity-retention fraction chosen
+  to match the total rows generated by the corresponding imbalanced sample;
+- `temporal_random_matched_*` preserves both the exact active-client count in
+  every communication round and each client's total selected rounds while
+  randomizing timing, thereby matching communication and aggregate client-update
+  compute without persistent or block structure.
+
+Run the implementation sanity check before the corrected IID experiment:
+
+```bash
+python scripts/run_iid_sanity.py \
+  --output outputs/iid_sanity.json
+```
+
+For validation-only hyperparameter freezing:
+
+```bash
+python scripts/select_hyperparameters.py \
+  --results outputs/crsp_compustat_profitability_fedadam_validation_grid/grid_results.csv \
+  --scenario-prefix fedadam_validation_lr_ \
+  --method fedadam \
+  --metric validation_selected_rank_ic \
+  --mode max \
+  --constraint-metric validation_selected_oos_r2_zero \
+  --constraint-min -0.05 \
+  --output-json outputs/fedadam_validation_selection.json \
+  --output-yaml outputs/fedadam_validation_selection.yaml
+```
+
+The selector rejects metrics not beginning with `validation_`; test Rank IC,
+Sharpe, and OOS R2 cannot be used by the selection command. The optional
+validation OOS-R2 constraint prevents selecting a learning rate solely because it
+maximizes rank correlation while producing unstable prediction scale.
+
+After the corrected grids finish, audit the identifying restrictions:
+
+```bash
+python scripts/validate_identification_outputs.py \
+  --partition-grid outputs/crsp_compustat_profitability_partition_common_grid \
+  --identification-grid outputs/crsp_compustat_profitability_identification_grid \
+  --output outputs/identification_audit.json
+```
+
+Generate the system/performance trade-off figures from any completed grid:
+
+```bash
+python scripts/plot_tradeoffs.py \
+  --results outputs/crsp_compustat_profitability_identification_grid/grid_results.csv \
+  --output-dir outputs/crsp_compustat_profitability_identification_grid/tradeoffs
+```
+
+### Validation prediction calibration
+
+When `evaluation.validation_prediction_calibration.enabled: true`, the selected
+checkpoint predicts the validation split, fits
+\(y=a+b\hat y\) there, and applies the frozen `a` and `b` to test predictions.
+The raw method remains unchanged and an additional `fedadam_calibrated` evaluation
+row is written. A strictly positive fitted slope preserves cross-sectional ranking, so the
+calibration diagnoses scale error rather than manufacturing a new ranking signal.
+When the validation slope is clipped to zero, the output is explicitly treated as
+a no-direction calibration failure rather than evidence of improved ranking.
+
+## Parallel execution
 
 There are two controlled parallelism levels:
 
@@ -221,13 +322,18 @@ including partial participation.
 - `resolved_config.json`: fully resolved benchmark configuration;
 - `source_validation.json`: target alignment, date consistency, universe, and industry checks;
 - `universe_filter.json`: price/microcap filter settings, cutoffs, and dropped rows;
+- `partition_common_universe.json`: row-identical partition universe, split counts, and SHA-256 fingerprint;
 - `heterogeneity.json`: measured client-size, distribution, feature, and participation heterogeneity;
 - `statistical_heterogeneity.json`: requested and realized controlled statistical stress-test settings;
 - `client_size_imbalance.csv`: requested and realized entity/row retention by client;
+- `client_size_matched_control.csv`: uniform entity downsampling matched to an imbalance scenario;
 - `label_skew.csv`: client target-bin preferences and realized target-bin shares;
+- `label_skew_diagnostics.csv`: before/after target dispersion, tail shares, monthly breadth, and effective target bins;
 - `covariate_shift_parameters.csv`: client-feature location and scale transformations;
 - `participation_schedule.csv`: exact active clients in every communication round;
+- `matched_reference_participation_schedule.csv`: structured schedule whose per-round counts are matched by a randomized control;
 - `client_availability.csv`: realized and expected availability by client;
+- `client_training_budget.csv`: rows, batches, and optimizer steps per selected round for every client;
 - `partition_assignments.parquet`: formation/target dates and training-defined clients;
 - `feature_masks.csv`: client-specific feature availability;
 - `checkpoints/<method>.pt`: selected validation checkpoint for each method;
@@ -235,6 +341,8 @@ including partial participation.
 - `training_<algorithm>.csv`: per-round loss and communication;
 - `validation_history_<method>.csv`: validation metric and selected checkpoint;
 - `predictions_<method>.parquet`: stock-level out-of-sample predictions and calibrated local portfolio score;
+- `validation_predictions_<method>.parquet`: validation-only predictions used to fit optional scale calibration;
+- `prediction_calibration_<method>.json`: frozen validation intercept/slope and observation count;
 - `monthly_predictive_metrics_<method>.csv`: monthly MSE, IC, RankIC, and prediction dispersion;
 - `portfolio_returns_<method>.csv`: explicitly selected primary portfolio;
 - `portfolio_returns_global_<method>.csv`: unconstrained pooled portfolio;
@@ -270,11 +378,12 @@ python scripts/analyze_results.py \
 
 ## Remaining publication work
 
-The code is an experimental benchmark implementation, not the finished empirical
-study. Before submission, run the full multi-seed grid and rolling windows, verify
-SCAFFOLD and FedAdam against an established FL library on at least one setting, add
-liquidity and value-weighted portfolio robustness checks, and document the exact
-security-universe construction used in every table.
+The corrected code resolves the principal identification issues in the first full
+run. Before submission, execute the common-universe partition grid, the matched
+identification grid, and the calibration grid; inspect the IID sanity JSON; freeze
+hyperparameters with the validation-only selector; then report paired seed or
+block-bootstrap uncertainty. Additional algorithms are lower priority than these
+controlled comparisons.
 
 ## Runtime logging
 
@@ -324,3 +433,22 @@ python -u scripts/run_benchmark.py --config configs/crsp_compustat_profitability
 ```
 
 See `GRID_PERFORMANCE.md` for panel caching, resume behavior, parallel-client settings, and the corrected local-step compute budget.
+
+## Troubleshooting: IID partition and read-only arrays
+
+Parquet columns backed by Arrow may expose read-only NumPy views. Version `0.6.0`
+avoids in-place shuffling when constructing `partition_iid_12`, preventing:
+
+```text
+ValueError: array is read-only
+```
+
+After upgrading, rerun the same grid command:
+
+```bash
+python -u scripts/run_grid.py \
+  --grid configs/crsp_compustat_profitability_partition_grid.yaml
+```
+
+With `resume_completed: true`, the 15 completed FF12, exchange, and size-quintile
+runs are reused, and only the five failed IID runs are executed again.

@@ -68,6 +68,7 @@ def assign_domain_clients(
     persistent_entity: bool = True,
     fit_split_col: str | None = "split",
     fit_split_value: str = "train",
+    missing_policy: str = "separate",
 ) -> pd.DataFrame:
     """Create domain clients without using validation/test data to fit the partition.
 
@@ -92,6 +93,20 @@ def assign_domain_clients(
         categories = _collapse_categories(
             series, series.loc[mask], max_clients=max_clients
         )
+
+    missing_policy = str(missing_policy).lower()
+    if missing_policy not in {"separate", "drop", "error"}:
+        raise ValueError("missing_policy must be separate, drop, or error.")
+    missing_mask = categories.astype("string") == "MISSING"
+    if missing_mask.any() and missing_policy == "error":
+        raise ValueError(
+            f"Domain partition using {domain_col!r} contains "
+            f"{int(missing_mask.sum())} missing rows."
+        )
+    if missing_mask.any() and missing_policy == "drop":
+        data = data.loc[~missing_mask].copy()
+        categories = categories.loc[data.index]
+        mask = mask.loc[data.index]
 
     if persistent_entity and entity_col is not None:
         if entity_col not in data.columns:

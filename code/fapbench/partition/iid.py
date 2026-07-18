@@ -14,13 +14,22 @@ def assign_iid_clients(
     """Assign complete entity histories to approximately balanced random clients."""
     if num_clients < 2:
         raise ValueError("num_clients must be at least 2.")
-    entities = frame[entity_col].dropna().drop_duplicates().to_numpy()
+    # Arrow-backed pandas columns can expose a read-only NumPy view.  Do not
+    # shuffle that view in place: doing so raises ``ValueError: array is
+    # read-only`` for Parquet-loaded panels.  Materialize an owned array and
+    # use ``permutation`` so the source values are never mutated.
+    entities = (
+        frame[entity_col]
+        .dropna()
+        .drop_duplicates()
+        .to_numpy(copy=True)
+    )
     if len(entities) < num_clients:
         raise ValueError(
             f"Only {len(entities)} unique entities are available for {num_clients} clients."
         )
     rng = np.random.default_rng(seed)
-    rng.shuffle(entities)
+    entities = rng.permutation(entities)
     mapping = {
         entity: f"client_{idx % num_clients:02d}"
         for idx, entity in enumerate(entities)
