@@ -1,3 +1,21 @@
 .idea
 paper-fap-bench/
 */outputs
+
+# Build artifacts. fapbench.egg-info was previously tracked and shipped in the
+# anonymized release, where PKG-INFO carried a copy of the README including the
+# author's home-directory paths -- a de-anonymization leak in a double-blind
+# submission.
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+
+# Local panel data. The CRSP--Compustat panel is licensed and must never be
+# committed; configs ship a placeholder path and take --data-path instead.
+*.parquet
+!code/data/synthetic.parquet
+
+.DS_Store

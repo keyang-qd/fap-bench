@@ -10,7 +10,7 @@ performance:
   prediction_batch_size: 65536
 output_dir: outputs/crsp_compustat_profitability
 data:
-  path: /Users/keyang/qdata/data0712.parquet
+  path: /path/to/qdata/data0712.parquet
   source_profile: crsp_compustat_profitability_v2
   date_col: formation_date
   entity_col: permno

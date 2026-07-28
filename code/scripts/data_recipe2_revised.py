@@ -237,7 +237,7 @@ def _merge_next_month_target(
 
 
 def data_recipe2(
-    input_path: str | os.PathLike[str] = "/Users/keyang/qdata",
+    input_path: str | os.PathLike[str] = "/path/to/qdata",
     output_path: str | os.PathLike[str] | None = None,
     formation_start: str = "1964-01",
     formation_end: str = "2023-12",
@@ -850,9 +850,9 @@ def data_recipe2(
 
 if __name__ == "__main__":
     panel = data_recipe2(
-        input_path="/Users/keyang/qdata",
-        output_path="/Users/keyang/qdata/data0712.parquet",
-        log_file="/Users/keyang/qdata/data0712_build.log",
+        input_path="/path/to/qdata",
+        output_path="/path/to/qdata/data0712.parquet",
+        log_file="/path/to/qdata/data0712_build.log",
         log_level="INFO",
     )
     print(panel.shape)

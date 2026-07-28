@@ -23,6 +23,15 @@ pip install -e .
 
 ## Data contract
 
+> **Panel path.** CRSP--Compustat is licensed and cannot be distributed, so every
+> shipped config carries the placeholder `/path/to/qdata/...`. Point runs at your
+> own built panel with `--data-path` (`run_grid.py` and
+> `run_publication_experiments.py` both accept it) rather than editing the YAML.
+> Resume compares the *resolved absolute* path, so reruns must pass the same
+> value to reuse completed cells. To try the pipeline without any licensed data,
+> use `python scripts/run_benchmark.py --config configs/synthetic_smoke.yaml`.
+
+
 The revised CRSP--Compustat recipe in `scripts/data_recipe2_revised.py` produces one row at formation month `t` and a strictly aligned delisting-adjusted target return in month `t+1`.
 
 The main configuration expects:
@@ -49,13 +58,13 @@ The data path in the base YAML is the author's local path. The safest invocation
 
 ```bash
 caffeinate -i python -u scripts/run_publication_experiments.py \
-  --data-path /Users/keyang/qdata/data0712.parquet
+  --data-path /path/to/qdata/data0712.parquet
 ```
 
 This one command now covers every phase, **including the expanded-features
 robustness check**: if `core_expanded_features` needs to run and
 `data0712_expanded.parquet` does not already exist at `--expanded-data-path`
-(default: alongside `--raw-data-dir`, default `/Users/keyang/qdata`), it is
+(default: alongside `--raw-data-dir`, default `/path/to/qdata`), it is
 built automatically before that phase trains (`data_recipe2(...,
 include_expanded_characteristics=True)`, ~30 minutes, one-time — pass
 `--rebuild-expanded-panel` to force a rebuild). `--data-path` never touches
@@ -81,7 +90,7 @@ The default plan contains 475 scenario-seed cells: 465 training cells and 10 dia
 
 ```bash
 python scripts/run_publication_experiments.py \
-  --data-path /Users/keyang/qdata/data0712.parquet \
+  --data-path /path/to/qdata/data0712.parquet \
   --dry-run
 ```
 
@@ -89,7 +98,7 @@ python scripts/run_publication_experiments.py \
 
 ```bash
 python -u scripts/run_publication_experiments.py \
-  --data-path /Users/keyang/qdata/data0712.parquet \
+  --data-path /path/to/qdata/data0712.parquet \
   --only core identification
 ```
 
@@ -418,8 +427,8 @@ Long sequential grids explicitly close each per-run log handler after completion
 | Script | Purpose |
 |---|---|
 | `run_publication_experiments.py` | complete publication run and output build |
-| `run_grid.py` | manually run one publication or synthetic grid |
-| `run_benchmark.py` | debug one resolved benchmark configuration |
+| `run_grid.py` | run one grid config (`configs/icaif_*.yaml`, `synthetic_grid.yaml`); takes `--data-path` |
+| `run_benchmark.py` | run one *single-run* config, e.g. `configs/synthetic_smoke.yaml` --- this is the quickest end-to-end check and needs no licensed data |
 | `run_iid_sanity.py` | exact one-step centralized/FedAvg equivalence check |
 | `validate_identification_outputs.py` | rerun partition and matched-control audits |
 | `analyze_results.py` | HAC return tests and block-bootstrap Sharpe intervals for a completed run |
@@ -474,8 +483,8 @@ without running the grid), use `scripts/build_expanded_panel.py` directly:
 
 ```bash
 python scripts/build_expanded_panel.py \
-  --input-path /Users/keyang/qdata \
-  --output-path /Users/keyang/qdata/data0712_expanded.parquet
+  --input-path /path/to/qdata \
+  --output-path /path/to/qdata/data0712_expanded.parquet
 ```
 
 `build_publication_outputs` also adds a `feature_set` comparison table,

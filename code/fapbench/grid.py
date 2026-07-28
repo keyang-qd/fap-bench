@@ -528,10 +528,26 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run multiple FAP-Bench scenarios and seeds.")
     parser.add_argument("--grid", required=True, help="Path to grid YAML.")
+    parser.add_argument(
+        "--data-path",
+        default=None,
+        help=(
+            "Override data.path for every scenario in the grid. The shipped base "
+            "configs carry a placeholder panel path, since the CRSP--Compustat "
+            "panel is licensed and cannot be distributed; point this at your own "
+            "built panel. Note resume compares the resolved absolute path, so "
+            "reruns must pass the same value to reuse completed cells."
+        ),
+    )
     parser.add_argument("--log-level", default=None)
     parser.add_argument("--log-file", default=None)
     args = parser.parse_args()
     config = load_config(args.grid)
+    if args.data_path:
+        config["base_overrides"] = deep_update(
+            config.get("base_overrides", {}),
+            {"data": {"path": str(Path(args.data_path).resolve())}},
+        )
     if args.log_level or args.log_file:
         config.setdefault("logging", {})
         if args.log_level:

@@ -22,11 +22,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Build the expanded CRSP-Compustat characteristic panel."
     )
-    parser.add_argument("--input-path", default="/Users/keyang/qdata")
+    parser.add_argument("--input-path", default="/path/to/qdata")
     parser.add_argument(
-        "--output-path", default="/Users/keyang/qdata/data0712_expanded.parquet"
+        "--output-path", default="/path/to/qdata/data0712_expanded.parquet"
     )
-    parser.add_argument("--log-file", default="/Users/keyang/qdata/data0712_expanded_build.log")
+    parser.add_argument("--log-file", default="/path/to/qdata/data0712_expanded_build.log")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 

@@ -147,7 +147,7 @@ def main() -> None:
     parser.add_argument(
         "--raw-data-dir",
         type=Path,
-        default=Path("/Users/keyang/qdata"),
+        default=Path("/path/to/qdata"),
         help=(
             "Directory containing compustat.csv/ccm.csv/crsp.csv/delisting.csv, "
             "used only to auto-build the expanded panel for core_expanded_features "

@@ -19,7 +19,7 @@ data:
   # panel has 20 characteristics total (7 profitability + 13 value/
   # investment/financing/accrual/intangible/size/momentum), matching the
   # ~20-25 target set in the plan to justify "high-dimensional" language.
-  path: /Users/keyang/qdata/data0712_expanded.parquet
+  path: /path/to/qdata/data0712_expanded.parquet
   source_profile: crsp_compustat_profitability_expanded_v1
   date_col: formation_date
   entity_col: permno
