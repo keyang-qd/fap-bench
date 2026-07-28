@@ -6,6 +6,7 @@ from fapbench.partition import (
     assign_domain_clients,
     assign_iid_clients,
     build_feature_masks,
+    build_feature_masks_matched_control,
     feature_jaccard_dissimilarity,
 )
 
@@ -59,6 +60,32 @@ def test_sampler_reproducible():
     sampler = ClientSampler(["a", "b", "c", "d"], 0.5, seed=3)
     assert sampler.sample(2) == sampler.sample(2)
     assert len(sampler.sample(2)) == 2
+
+
+def test_feature_masks_matched_control_is_identical_across_clients():
+    # Real 7-characteristic panel and severity configs from
+    # configs/icaif_heterogeneity.yaml. Severe (common_fraction=0.15,
+    # private_fraction=0.35) is a regression test: for this config only 3 of
+    # 7 features are covered by a single shared draw, so a naive
+    # "draw the private subset once" fix that still ran build_feature_masks's
+    # coverage-completion pass would silently hand 4 extra, unevenly
+    # distributed features back to specific clients -- exactly the asymmetry
+    # this matched control is supposed to remove.
+    features = [f"f{i}" for i in range(7)]
+    clients = [f"client_{i:02d}" for i in range(12)]
+    for common_fraction, private_fraction in [(0.70, 0.70), (0.50, 0.50), (0.15, 0.35)]:
+        treatment = build_feature_masks(
+            features, clients, common_fraction, private_fraction, seed=11
+        )
+        matched = build_feature_masks_matched_control(
+            features, clients, common_fraction, private_fraction, seed=11
+        )
+        treatment_counts = {int(mask.sum()) for mask in treatment.values()}
+        matched_counts = {int(mask.sum()) for mask in matched.values()}
+        assert matched_counts == treatment_counts
+        assert feature_jaccard_dissimilarity(matched) == 0.0
+        first = next(iter(matched.values()))
+        assert all(np.array_equal(mask, first) for mask in matched.values())
 
 
 def test_domain_can_keep_entity_persistent():

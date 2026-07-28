@@ -1,0 +1,125 @@
+# Does the data-level / system-level separation survive the LINEAR model?
+#
+# Companion to configs/icaif_capacity_separation.yaml, and the other half of the
+# same defence. The robustness grid showed a linear/ridge model beats the
+# reference MLP on Rank IC for five of seven methods, which invites the reading
+# that the whole benchmark -- including RQ3's matched-control contrasts -- is
+# computed at an architecture the paper's own evidence shows is dominated.
+#
+# RQ1 is already defended against that reading: metric disagreement holds at all
+# three model classes (robustness_metric_rank_agreement). RQ3 is not, because the
+# heterogeneity and identification grids only ever ran at [64,32]. This config
+# closes that gap from below, as icaif_capacity_separation.yaml closes it from
+# above. Run both and the identification result is measured at 8, 2,625, and
+# 35,073 parameters -- an order of magnitude either side of the reference.
+#
+# Same three pairs as the capacity config, chosen to span the claim:
+#   - feature_heterogeneity_severe  : largest data-level effect (0.0199, FedAvg)
+#   - covariate_shift_strong        : other data-level family (0.0131, FedAvg)
+#   - temporal_block_outages        : largest system-level effect (0.0020, SCAFFOLD)
+# If the separation is a property of the identification design rather than of the
+# architecture, the first two stay an order of magnitude above the third here too.
+#
+# Treatment parameters below are copied verbatim from icaif_capacity_separation.yaml
+# (which in turn is diffed against icaif_heterogeneity.yaml / icaif_identification.yaml).
+# If you edit any of them, re-check all three files together -- the contrasts are
+# only comparable across model classes while the treatments are identical.
+#
+# 6 scenarios x 10 seeds = 60 cells.
+#
+# Analyse with seed_averaged_dispersion_contrasts pointed at this phase, then
+# compare effects against the same pairs in the main grids and the capacity grid.
+#
+# Run:
+#   caffeinate -dims python -u scripts/run_grid.py --grid configs/icaif_linear_separation.yaml
+#
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/icaif_publication/linear_separation
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+grid_execution:
+  parallel_runs: 2
+  max_total_client_workers: 6
+  max_total_torch_threads: 6
+  start_method: spawn
+  parallel_child_console: false
+child_logging:
+  console: true
+  round_interval: 5
+  epoch_interval: 5
+
+base_overrides:
+  # hidden_dims: [] reduces AssetPricingMLP to a single output layer, i.e. linear
+  # regression; federated.weight_decay supplies the L2 penalty. Matches the
+  # `linear_ridge_weak` scenario of icaif_robustness.yaml (~8 parameters).
+  model:
+    hidden_dims: []
+    dropout: 0.0
+    batch_norm: false
+  # Only the three federated methods carry the contrast; the centralized and
+  # local baselines are not needed and would triple the cost.
+  baselines:
+    centralized: false
+    centralized_masked: false
+    local: false
+  federated:
+    algorithms: [fedavg, scaffold, fedadam]
+    weight_decay: 0.0001
+
+seeds: [11, 22, 33, 44, 55, 66, 77, 88, 99, 110]
+
+scenarios:
+  # --- data-level pair 1: feature availability, severe -----------------------
+  - name: feature_heterogeneity_severe
+    overrides:
+      feature_heterogeneity:
+        enabled: true
+        common_fraction: 0.15
+        private_fraction: 0.35
+        shared_private_selection: false
+      federated: {rounds: 50, participation_rate: 1.0, server_lr: 0.003}
+  - name: feature_heterogeneity_severe_matched
+    overrides:
+      feature_heterogeneity:
+        enabled: true
+        common_fraction: 0.15
+        private_fraction: 0.35
+        shared_private_selection: true
+      federated: {rounds: 50, participation_rate: 1.0, server_lr: 0.003}
+
+  # --- data-level pair 2: covariate shift, strong ---------------------------
+  - name: covariate_shift_strong
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance: {enabled: false}
+        client_size_matched_control: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: true, location_std: 0.5, log_scale_std: 0.3}
+        covariate_shift_matched_control: {enabled: false}
+      federated: {rounds: 50, participation_rate: 1.0, server_lr: 0.003}
+  - name: covariate_shift_strong_matched
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance: {enabled: false}
+        client_size_matched_control: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: false}
+        covariate_shift_matched_control:
+          {enabled: true, location_std: 0.5, log_scale_std: 0.3}
+      federated: {rounds: 50, participation_rate: 1.0, server_lr: 0.003}
+
+  # --- system-level pair: block outages -------------------------------------
+  - name: temporal_block_outages_identified
+    overrides:
+      temporal_heterogeneity: {enabled: true, mode: block, block_fraction: 0.40}
+      federated: {rounds: 50, participation_rate: 1.0, server_lr: 0.003}
+  - name: temporal_random_matched_block_outages
+    overrides:
+      temporal_heterogeneity:
+        enabled: true
+        mode: matched_random
+        matched_reference: {mode: block, block_fraction: 0.40}
+      federated: {rounds: 50, participation_rate: 1.0, server_lr: 0.003}

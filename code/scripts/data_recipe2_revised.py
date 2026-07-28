@@ -22,6 +22,41 @@ PROFITABILITY_COMPONENTS = [
     "fcfoa",
 ]
 
+# Optional value/investment/leverage/intangible/momentum/size characteristics,
+# added on top of the profitability set only when
+# data_recipe2(..., include_expanded_characteristics=True) is requested
+# (default False, so the original 7-characteristic panel and its existing
+# tests/outputs are unaffected). Together with PROFITABILITY_COMPONENTS this
+# brings the panel to 20 total characteristics, closing the gap between the
+# original 7-characteristic panel and the ~20-25 characteristic target set in
+# EXPERIMENT_ENHANCEMENT_PLAN.md Tier 2 needed to justify "high-dimensional"
+# language in the paper's motivation:
+#   value:      bm (book-to-market), ep (earnings yield), cfp (cash-flow
+#               yield), sp (sales-to-price), dy (dividend yield)
+#   investment: agr (asset growth), capx_at (capital investment intensity)
+#   financing:  lev (book leverage, total liabilities / assets)
+#   accruals:   acc_at (Sloan-1996-style accruals-to-assets)
+#   intangible: rdoa (R&D intensity, R&D expense / assets)
+#   size:       logme (log market equity)
+#   momentum:   mom_2_12 (12-2 skip-month momentum), mom_1_1 (prior 1-month
+#               return / short-term reversal)
+EXPANDED_CHARACTERISTIC_COMPONENTS = [
+    "bm", "ep", "cfp", "sp", "dy",
+    "agr", "capx_at",
+    "lev",
+    "acc_at",
+    "rdoa",
+    "logme",
+    "mom_2_12", "mom_1_1",
+]
+
+# Skip-month momentum window: cumulative return over months [t-12, t-2],
+# excluding the most recent month t-1 (the standard Jegadeesh-Titman/UMD
+# construction). Expressed as (start_lag, end_lag) exact calendar-month lags
+# relative to the formation month.
+MOMENTUM_START_LAG = 2
+MOMENTUM_END_LAG = 12
+
 
 LOGGER_NAME = "data_recipe"
 
@@ -131,6 +166,36 @@ def _exact_month_lag(
     return df.merge(lagged, on=["permno", "year_month"], how="left", validate="one_to_one")
 
 
+def _trailing_contiguous_return(
+    df: pd.DataFrame,
+    start_lag: int,
+    end_lag: int,
+    output_col: str,
+) -> pd.DataFrame:
+    """Cumulative return over months [t-end_lag, t-start_lag], requiring every
+    intervening month to be present at an exact one-month calendar spacing.
+
+    Reuses ``_exact_month_lag`` once per lag so each lagged return column goes
+    through the same permno/year_month exact-match merge already used
+    elsewhere in this recipe (e.g. for ``me_lag``), rather than a new rolling-
+    window implementation. A missing intervening month yields NaN rather than
+    a stale value, consistent with this recipe's convention of never
+    forward-filling returns.
+    """
+    if start_lag < 1 or end_lag < start_lag:
+        raise ValueError("Momentum window requires 1 <= start_lag <= end_lag.")
+    result = df
+    lag_columns = []
+    for lag in range(start_lag, end_lag + 1):
+        suffix = f"_lag{lag}"
+        result = _exact_month_lag(result, ["retadj"], lag_months=lag, suffix=suffix)
+        lag_columns.append(f"retadj{suffix}")
+    complete = result[lag_columns].notna().all(axis=1)
+    cumulative_return = (1.0 + result[lag_columns].fillna(0.0)).prod(axis=1) - 1.0
+    result[output_col] = cumulative_return.where(complete)
+    return result.drop(columns=lag_columns)
+
+
 def _cross_sectional_rank_zscore(series: pd.Series) -> pd.Series:
     """Replicate rank-then-z-score while handling tiny cross sections safely."""
     ranks = series.rank(method="average")
@@ -180,12 +245,23 @@ def data_recipe2(
     accounting_end: str = "2024-12",
     log_level: str | int = "INFO",
     log_file: str | os.PathLike[str] | None = None,
+    include_expanded_characteristics: bool = False,
 ) -> pd.DataFrame:
     """Build a monthly CRSP--Compustat profitability panel.
 
     The returned data use month-t characteristics and an exactly aligned month-(t+1)
     delisting-adjusted return in ``retadj_1mn``. Market variables and returns are
     never forward-filled.
+
+    ``include_expanded_characteristics`` defaults to False and reproduces the
+    original 7-characteristic profitability panel exactly. When True, it adds
+    13 more characteristics across value (``bm``, ``ep``, ``cfp``, ``sp``,
+    ``dy``), investment (``agr``, ``capx_at``), financing (``lev``),
+    accruals (``acc_at``), intangible investment (``rdoa``), size
+    (``logme``), and momentum (``mom_2_12``, ``mom_1_1``) -- see
+    EXPANDED_CHARACTERISTIC_COMPONENTS -- each with its own cross-sectional
+    rank z-score, bringing the panel to 20 characteristics total for the
+    robustness check described in EXPERIMENT_ENHANCEMENT_PLAN.md.
     """
     total_started = time.perf_counter()
     logger = _configure_logger(log_level=log_level, log_file=log_file)
@@ -211,17 +287,20 @@ def data_recipe2(
     # ------------------------------------------------------------------
     # Compustat annual fundamentals
     # ------------------------------------------------------------------
-    _require_columns(
-        comp,
-        [
-            "gvkey", "datadate", "indfmt", "datafmt", "popsrc", "consol",
-            "seq", "ceq", "pstk", "at", "lt", "txditc", "txdb", "itcb",
-            "pstkrv", "pstkl", "act", "lct", "che", "dlc", "txp", "revt",
-            "cogs", "xint", "xsga", "oiadp", "txpd", "ib", "dp", "capx",
-            "dltt", "sale", "sic",
-        ],
-        "compustat.csv",
-    )
+    required_compustat_columns = [
+        "gvkey", "datadate", "indfmt", "datafmt", "popsrc", "consol",
+        "seq", "ceq", "pstk", "at", "lt", "txditc", "txdb", "itcb",
+        "pstkrv", "pstkl", "act", "lct", "che", "dlc", "txp", "revt",
+        "cogs", "xint", "xsga", "oiadp", "txpd", "ib", "dp", "capx",
+        "dltt", "sale", "sic",
+    ]
+    if include_expanded_characteristics:
+        # dvt (total dividends, for dy) and xrd (R&D expense, for rdoa) are
+        # only needed on the expanded-characteristics path -- required
+        # unconditionally would break the default 7-characteristic path
+        # against any Compustat extract/fixture that omits them.
+        required_compustat_columns = [*required_compustat_columns, "dvt", "xrd"]
+    _require_columns(comp, required_compustat_columns, "compustat.csv")
     _require_columns(
         ccm,
         ["gvkey", "permno", "permco", "linkdt", "linkenddt", "linktype", "linkprim"],
@@ -300,6 +379,8 @@ def data_recipe2(
         "cogs", "xint", "xsga", "oiadp", "txpd", "ib", "dp", "capx",
         "dltt", "sale", "sic", "fyear", "oibdp",
     ]
+    if include_expanded_characteristics:
+        numeric_comp_columns = [*numeric_comp_columns, "dvt", "xrd"]
     _coerce_numeric(comp_m, numeric_comp_columns)
 
     common_equity_base = pd.concat(
@@ -351,6 +432,29 @@ def data_recipe2(
     comp_m["nopoa"] = comp_m["nop"] / comp_m["at"]
     comp_m["gmar"] = comp_m["gp"] / comp_m["sale"]
 
+    # Prior-fiscal-year total assets, computed the same way as wc_last above:
+    # a strict same-entity shift over datadate-sorted annual filings, so no
+    # look-ahead is introduced. Only used when include_expanded_characteristics
+    # requests the "agr" (asset growth) characteristic below.
+    comp_m["at_last"] = comp_m.groupby("gvkey", observed=True)["at"].shift(1)
+    comp_m["agr"] = (comp_m["at"] - comp_m["at_last"]) / comp_m["at_last"]
+
+    if include_expanded_characteristics:
+        # Additional annual-level ratios, each an existing Compustat
+        # fundamental scaled by total assets, following exactly the same
+        # pattern as agr above (computed here, industry/global-median
+        # imputed alongside the other annual ratios below, then
+        # forward-filled monthly like every other fundamental).
+        comp_m["capx_at"] = comp_m["capx"] / comp_m["at"]
+        comp_m["lev"] = comp_m["lt"] / comp_m["at"]
+        comp_m["acc_at"] = comp_m["acc"] / comp_m["at"]
+        # A missing R&D expense in Compustat conventionally means the firm
+        # reported no R&D that year, not that the value is unknown -- fill
+        # with 0 before scaling, unlike the ratios above (and dvt below),
+        # which are genuinely-missing values imputed via industry/global
+        # medians instead.
+        comp_m["rdoa"] = comp_m["xrd"].fillna(0.0) / comp_m["at"]
+
     comp_m["year_month"] = comp_m["availability_month"]
     comp_m["sic"] = pd.to_numeric(comp_m["sic"], errors="coerce").astype("Int64")
     comp_m["sic2"] = (comp_m["sic"] // 100).astype("Int64")
@@ -363,6 +467,11 @@ def data_recipe2(
         "wc", "wc_chg", "acc", "ic", "op", "gp", "nop", "fcf", "roa",
         "gpoa", "roe", "fcfoa", "roic", "nopoa", "opoa", "gmar",
     ]
+    if include_expanded_characteristics:
+        compustat_columns = [
+            *compustat_columns,
+            "agr", "dvt", "capx_at", "lev", "acc_at", "rdoa",
+        ]
     comp_m_final = comp_m[compustat_columns].replace([np.inf, -np.inf], np.nan)
     comp_m_final = (
         comp_m_final.sort_values(["permno", "year_month", "datadate"])
@@ -372,18 +481,24 @@ def data_recipe2(
         comp_m_final["year_month"].between(accounting_start, accounting_end)
     ].copy()
 
-    # Impute annual profitability ratios only; identifiers and dates are untouched.
+    # Impute annual profitability ratios (and, when requested, agr) only;
+    # identifiers and dates are untouched.
+    annual_impute_columns = list(PROFITABILITY_COMPONENTS)
+    if include_expanded_characteristics:
+        annual_impute_columns.extend(
+            ["agr", "dvt", "capx_at", "lev", "acc_at", "rdoa"]
+        )
     with _log_stage(logger, "Impute annual profitability ratios"):
-        missing_before = comp_m_final[PROFITABILITY_COMPONENTS].isna().mean().mean()
-        comp_m_final[PROFITABILITY_COMPONENTS] = (
-            comp_m_final.groupby(["year_month", "sic2"], observed=True)[PROFITABILITY_COMPONENTS]
+        missing_before = comp_m_final[annual_impute_columns].isna().mean().mean()
+        comp_m_final[annual_impute_columns] = (
+            comp_m_final.groupby(["year_month", "sic2"], observed=True)[annual_impute_columns]
             .transform(lambda values: values.fillna(values.median()))
         )
-        comp_m_final[PROFITABILITY_COMPONENTS] = (
-            comp_m_final.groupby("year_month", observed=True)[PROFITABILITY_COMPONENTS]
+        comp_m_final[annual_impute_columns] = (
+            comp_m_final.groupby("year_month", observed=True)[annual_impute_columns]
             .transform(lambda values: values.fillna(values.median()))
         )
-        missing_after = comp_m_final[PROFITABILITY_COMPONENTS].isna().mean().mean()
+        missing_after = comp_m_final[annual_impute_columns].isna().mean().mean()
     logger.info(
         "Annual profitability missing rate | before=%.2f%% | after=%.2f%%",
         100.0 * missing_before,
@@ -548,6 +663,11 @@ def data_recipe2(
         *PROFITABILITY_COMPONENTS,
         "ib", "at", "gp", "be", "fcf", "oiadp", "ic", "sale", "op",
     ]
+    if include_expanded_characteristics:
+        raw_profitability_and_scale = [
+            *raw_profitability_and_scale,
+            "agr", "dvt", "dp", "capx_at", "lev", "acc_at", "rdoa",
+        ]
     with _log_stage(logger, "Impute monthly profitability and scale variables"):
         monthly_missing_before = df[raw_profitability_and_scale].isna().mean().mean()
         df[raw_profitability_and_scale] = (
@@ -565,14 +685,46 @@ def data_recipe2(
         100.0 * monthly_missing_after,
     )
 
+    if include_expanded_characteristics:
+        # bm/ep/cfp/sp/dy all divide an already industry/global-median-imputed
+        # annual fundamental (be/ib/dp/sale/dvt) by me, which is a raw CRSP
+        # market variable that is never imputed and always present for the
+        # formation universe.
+        df["bm"] = df["be"] / df["me"]
+        df["ep"] = df["ib"] / df["me"]
+        df["cfp"] = (df["ib"] + df["dp"]) / df["me"]
+        df["sp"] = df["sale"] / df["me"]
+        df["dy"] = df["dvt"] / df["me"]
+        df["logme"] = np.log1p(df["me"])
+        # Prior 1-month return (short-term reversal). df["retadj"] at
+        # formation month t is already the realized month-t return merged
+        # from CRSP -- no additional lag merge is needed, since it is
+        # exactly the "prior 1-month return" used to predict month t+1.
+        df["mom_1_1"] = df["retadj"]
+        with _log_stage(logger, "Construct skip-month momentum (mom_2_12)"):
+            df = _trailing_contiguous_return(
+                df, MOMENTUM_START_LAG, MOMENTUM_END_LAG, output_col="mom_2_12"
+            )
+        logger.info(
+            "Expanded characteristic coverage | bm_nonmissing=%s | "
+            "dy_nonmissing=%s | rdoa_nonmissing=%s | mom_2_12_nonmissing=%s",
+            f"{int(df['bm'].notna().sum()):,}",
+            f"{int(df['dy'].notna().sum()):,}",
+            f"{int(df['rdoa'].notna().sum()):,}",
+            f"{int(df['mom_2_12'].notna().sum()):,}",
+        )
+
     # Construct monthly cross-sectional rank z-scores after monthly imputation.
+    characteristics_to_score = list(PROFITABILITY_COMPONENTS)
+    if include_expanded_characteristics:
+        characteristics_to_score += EXPANDED_CHARACTERISTIC_COMPONENTS
     with _log_stage(logger, "Construct monthly cross-sectional rank z-scores"):
-        for index, feature in enumerate(PROFITABILITY_COMPONENTS, start=1):
+        for index, feature in enumerate(characteristics_to_score, start=1):
             feature_started = time.perf_counter()
             logger.info(
                 "Z-score progress | %s/%s | feature=%s",
                 index,
-                len(PROFITABILITY_COMPONENTS),
+                len(characteristics_to_score),
                 feature,
             )
             df[f"{feature}_rank"] = df.groupby("year_month", observed=True)[feature].rank(method="average")
@@ -591,6 +743,9 @@ def data_recipe2(
 
     zscore_columns = [f"{feature}_zscore" for feature in PROFITABILITY_COMPONENTS]
     df["profitability_simple"] = df[zscore_columns].mean(axis=1, skipna=False)
+    expanded_zscore_columns = [
+        f"{feature}_zscore" for feature in EXPANDED_CHARACTERISTIC_COMPONENTS
+    ]
 
     df["shares"] = df["shrout"] * df["cfacshr"]
     with _log_stage(logger, "Attach exact one-month share-count lag"):
@@ -633,6 +788,12 @@ def data_recipe2(
         "roe_zscore", "roic_zscore", "opoa_zscore", "gmar_zscore",
         "fcfoa_zscore", "profitability_simple",
     ]
+    if include_expanded_characteristics:
+        final_columns = [
+            *final_columns,
+            *EXPANDED_CHARACTERISTIC_COMPONENTS,
+            *expanded_zscore_columns,
+        ]
 
     # Some source extracts may omit nonessential accounting fields.
     final_columns = [column for column in final_columns if column in df.columns]
@@ -640,6 +801,8 @@ def data_recipe2(
         df = df[final_columns].replace([np.inf, -np.inf], np.nan)
 
     required_model_columns = [*zscore_columns, "profitability_simple", "retadj_1mn"]
+    if include_expanded_characteristics:
+        required_model_columns = [*required_model_columns, *expanded_zscore_columns]
     before_required_drop = len(df)
     df = df.dropna(subset=required_model_columns)
     df = df.sort_values(["target_year_month", "permno"]).reset_index(drop=True)

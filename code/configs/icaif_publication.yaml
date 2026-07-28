@@ -1,0 +1,23 @@
+output_root: outputs/icaif_publication
+expected_fedadam_server_lr: 0.003
+run_iid_sanity: true
+phases:
+  - {name: fedadam_validation, grid: icaif_fedadam_validation.yaml}
+  - {name: core, grid: icaif_core.yaml}
+  - {name: partitions, grid: icaif_partitions.yaml}
+  - {name: heterogeneity, grid: icaif_heterogeneity.yaml}
+  - {name: identification, grid: icaif_identification.yaml}
+  - {name: label_diagnostics, grid: icaif_label_diagnostics.yaml}
+  - {name: core_expanded_features, grid: icaif_core_expanded_features.yaml}
+selection:
+  phase: fedadam_validation
+  scenario_prefix: fedadam_validation_lr_
+  method: fedadam
+  metric: validation_selected_rank_ic
+  mode: max
+  constraint_metric: validation_selected_oos_r2_zero
+  constraint_min: -0.05
+publication:
+  reference_scenario: ff12_full_participation
+  headline_methods: [centralized, local, fedavg, fedprox, scaffold, fedadam]
+  comparison_methods: [centralized, fedavg, scaffold, fedadam]

@@ -5,6 +5,16 @@ from collections.abc import Iterable, Mapping
 import numpy as np
 
 
+def _common_and_private_pool(
+    rng: np.random.Generator, n_features: int, common_fraction: float
+) -> tuple[np.ndarray, np.ndarray]:
+    perm = rng.permutation(n_features)
+    n_common = int(round(common_fraction * n_features))
+    if common_fraction > 0 and n_common == 0:
+        n_common = 1
+    return perm[:n_common], perm[n_common:]
+
+
 def build_feature_masks(
     feature_names: Iterable[str],
     client_ids: Iterable[str],
@@ -31,12 +41,7 @@ def build_feature_masks(
 
     rng = np.random.default_rng(seed)
     n_features = len(features)
-    perm = rng.permutation(n_features)
-    n_common = int(round(common_fraction * n_features))
-    if common_fraction > 0 and n_common == 0:
-        n_common = 1
-    common = perm[:n_common]
-    private_pool = perm[n_common:]
+    common, private_pool = _common_and_private_pool(rng, n_features, common_fraction)
     n_private = int(round(private_fraction * len(private_pool)))
 
     masks: dict[str, np.ndarray] = {}
@@ -57,6 +62,60 @@ def build_feature_masks(
     for idx, feature_idx in enumerate(unavailable):
         masks[str(clients[idx % len(clients)])][feature_idx] = 1.0
     return masks
+
+
+def build_feature_masks_matched_control(
+    feature_names: Iterable[str],
+    client_ids: Iterable[str],
+    common_fraction: float,
+    private_fraction: float = 0.5,
+    seed: int = 42,
+) -> dict[str, np.ndarray]:
+    """Matched control for build_feature_masks: identical common+private
+    selection for every client.
+
+    build_feature_masks already gives every client the same feature *count*
+    (n_common + n_private is identical by construction) -- only *identity*
+    (which private features) varies per client. This control draws that
+    private selection once instead of once per client, so every client sees
+    the exact same feature set, isolating whether cross-client divergence in
+    feature identity matters beyond having fewer features at all.
+
+    Uses the same rng seed/prefix as build_feature_masks (via
+    _common_and_private_pool), so the shared selection is a genuine collapse
+    of the treatment's construction, not an independent draw. Deliberately
+    skips the "every feature visible to someone" coverage-completion pass in
+    build_feature_masks: that pass exists to give the federation full
+    coverage under *independent* per-client draws, and would reintroduce
+    per-client asymmetry if applied on top of a single shared draw (verified
+    empirically: for the severe config on the 7-feature panel, only 3 of 7
+    features are covered by one shared draw, so that pass would silently hand
+    4 extra, unevenly-distributed features back to specific clients).
+    """
+    features = list(feature_names)
+    clients = list(client_ids)
+    if not features:
+        raise ValueError("feature_names cannot be empty.")
+    if not clients:
+        raise ValueError("client_ids cannot be empty.")
+    if not 0.0 <= common_fraction <= 1.0:
+        raise ValueError("common_fraction must be in [0, 1].")
+    if not 0.0 <= private_fraction <= 1.0:
+        raise ValueError("private_fraction must be in [0, 1].")
+
+    rng = np.random.default_rng(seed)
+    n_features = len(features)
+    common, private_pool = _common_and_private_pool(rng, n_features, common_fraction)
+    n_private = int(round(private_fraction * len(private_pool)))
+
+    mask = np.zeros(n_features, dtype=np.float32)
+    mask[common] = 1.0
+    if n_private > 0:
+        selected = rng.choice(private_pool, size=n_private, replace=False)
+        mask[selected] = 1.0
+    if mask.sum() == 0:
+        mask[int(rng.integers(0, n_features))] = 1.0
+    return {str(client): mask.copy() for client in clients}
 
 
 def apply_feature_mask(x: np.ndarray, mask: np.ndarray) -> np.ndarray:

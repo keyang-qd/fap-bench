@@ -22,6 +22,7 @@ from fapbench.data import (
     PanelPreprocessor,
     PanelSpec,
     apply_universe_filters,
+    client_local_rank_zscore,
     load_panel,
     prepare_panel,
     split_by_time,
@@ -45,6 +46,7 @@ from fapbench.selection import ValidationCheckpoint, combine_selection_histories
 from fapbench.partition import (
     ClientSampler,
     add_ff12_column,
+    add_sic_major_group_column,
     apply_client_size_imbalance,
     apply_partition_common_universe,
     apply_size_matched_uniform_control,
@@ -53,8 +55,10 @@ from fapbench.partition import (
     apply_regression_label_skew,
     assign_domain_clients,
     assign_iid_clients,
+    build_covariate_shift_matched_control_parameters,
     build_covariate_shift_parameters,
     build_feature_masks,
+    build_feature_masks_matched_control,
     covariate_shift_frame,
     randomize_schedule_client_identity,
     regression_label_diagnostics,
@@ -63,6 +67,7 @@ from fapbench.partition import (
     temporal_unavailability,
 )
 from fapbench.utils import (
+    close_logger,
     configure_logger,
     ensure_dir,
     format_seconds,
@@ -112,6 +117,47 @@ def _save_local_checkpoints(
         },
         path,
     )
+
+
+def _local_tuning_grid(
+    baseline_cfg: dict[str, Any],
+    default_lr: float,
+    default_weight_decay: float,
+    *,
+    selection_enabled: bool = True,
+) -> list[tuple[float, float]]:
+    """Candidate (learning_rate, weight_decay) pairs for the local-only baseline.
+
+    By default local models inherit the federated client hyperparameters, which
+    makes "federation helps" partly a statement about the budget-matching
+    protocol rather than about collaboration: the local baseline never got a
+    configuration chosen for it. Enabling ``baselines.local_tuning`` sweeps the
+    listed values and selects per client on validation Rank IC, so each client
+    is represented by the best local model it could have trained for itself.
+
+    Returns a single-element list (the inherited configuration) when tuning is
+    disabled, which keeps the default behaviour byte-identical.
+    """
+    tuning_cfg = baseline_cfg.get("local_tuning", {}) or {}
+    if not bool(tuning_cfg.get("enabled", False)):
+        return [(default_lr, default_weight_decay)]
+    if not selection_enabled:
+        # Without per-client validation there is no signal to select on, so the
+        # sweep would silently keep whichever candidate happened to be first.
+        raise ValueError(
+            "baselines.local_tuning requires model_selection.enabled: per-client "
+            "hyperparameter selection scores candidates on validation Rank IC, "
+            "which is only computed when validation selection is on."
+        )
+    learning_rates = [
+        float(value)
+        for value in tuning_cfg.get("learning_rates", [default_lr])
+    ] or [default_lr]
+    weight_decays = [
+        float(value)
+        for value in tuning_cfg.get("weight_decays", [default_weight_decay])
+    ] or [default_weight_decay]
+    return [(lr, wd) for lr in learning_rates for wd in weight_decays]
 
 
 def _model_fn(config: dict[str, Any], input_dim: int):
@@ -811,6 +857,7 @@ def run(
                 split_date_col,
                 train_end=split_cfg.get("train_end"),
                 val_end=split_cfg.get("val_end"),
+                test_end=split_cfg.get("test_end"),
                 ratios=split_cfg.get("ratios", [0.6, 0.2, 0.2]),
             )
             split_counts = panel["split"].value_counts(dropna=False).to_dict()
@@ -894,6 +941,32 @@ def run(
                         f"{before_drop - len(panel):,}",
                     )
                     domain_col = output_col
+                elif partition_cfg.get("transform", "").lower() == "sic_major_group":
+                    output_col = partition_cfg.get("output_col", "sic_major_group")
+                    panel = add_sic_major_group_column(
+                        panel, sic_col=domain_col, output_col=output_col
+                    )
+                    before_drop = len(panel)
+                    if bool(partition_cfg.get("drop_missing_domain", True)):
+                        panel = panel.dropna(subset=[output_col]).copy()
+                        missing_action = "dropped"
+                    else:
+                        missing_label = str(
+                            partition_cfg.get(
+                                "missing_domain_label", "MissingSIC"
+                            )
+                        )
+                        panel[output_col] = panel[output_col].fillna(
+                            missing_label
+                        )
+                        missing_action = f"assigned_to_{missing_label}"
+                    logger.info(
+                        "SIC-major-group transform | output_col=%s | missing_action=%s | dropped_missing=%s",
+                        output_col,
+                        missing_action,
+                        f"{before_drop - len(panel):,}",
+                    )
+                    domain_col = output_col
                 panel = assign_domain_clients(
                     panel,
                     domain_col=domain_col,
@@ -915,6 +988,27 @@ def run(
             else:
                 raise ValueError("partition.type must be iid or domain.")
             log_frame(logger, "Partitioned panel", panel, date_col=spec.date_col, entity_col=spec.entity_col, client_col="client_id")
+
+        # Optional client-local standardization. Must run here: after clients
+        # exist, before the splits are taken, so every split sees the same
+        # transform. Off by default, so all previously published results are
+        # byte-identical.
+        client_local_standardization = bool(
+            data_cfg.get("client_local_standardization", False)
+        )
+        if client_local_standardization:
+            with log_stage(logger, "Client-local standardization"):
+                panel = client_local_rank_zscore(
+                    panel,
+                    features,
+                    client_col="client_id",
+                    date_col=spec.date_col,
+                )
+                logger.info(
+                    "Client-local standardization | features=%s | clients=%s",
+                    len(features),
+                    panel["client_id"].nunique(),
+                )
 
         train = panel.loc[panel["split"] == "train"].copy()
         val = panel.loc[panel["split"] == "val"].copy()
@@ -1089,15 +1183,36 @@ def run(
             )
 
         covariate_cfg = statistical_cfg.get("covariate_shift", {})
-        if bool(statistical_cfg.get("enabled", False)) and bool(
-            covariate_cfg.get("enabled", False)
+        matched_covariate_cfg = statistical_cfg.get("covariate_shift_matched_control", {})
+        if bool(covariate_cfg.get("enabled", False)) and bool(
+            matched_covariate_cfg.get("enabled", False)
         ):
-            with log_stage(logger, "Apply client-specific covariate shift"):
-                locations, scales = build_covariate_shift_parameters(
+            raise ValueError(
+                "Enable either covariate_shift or covariate_shift_matched_control, "
+                "not both."
+            )
+        if bool(statistical_cfg.get("enabled", False)) and (
+            bool(covariate_cfg.get("enabled", False))
+            or bool(matched_covariate_cfg.get("enabled", False))
+        ):
+            matched_control = bool(matched_covariate_cfg.get("enabled", False))
+            active_cfg = matched_covariate_cfg if matched_control else covariate_cfg
+            stage_label = (
+                "Apply matched uniform covariate-shift control"
+                if matched_control
+                else "Apply client-specific covariate shift"
+            )
+            with log_stage(logger, stage_label):
+                builder = (
+                    build_covariate_shift_matched_control_parameters
+                    if matched_control
+                    else build_covariate_shift_parameters
+                )
+                locations, scales = builder(
                     clients,
                     features,
-                    location_std=float(covariate_cfg.get("location_std", 0.25)),
-                    log_scale_std=float(covariate_cfg.get("log_scale_std", 0.15)),
+                    location_std=float(active_cfg.get("location_std", 0.25)),
+                    log_scale_std=float(active_cfg.get("log_scale_std", 0.15)),
                     seed=seed,
                 )
                 train = apply_covariate_shift(
@@ -1115,12 +1230,13 @@ def run(
                 )
                 statistical_report.update(
                     {
-                        "covariate_shift_enabled": True,
+                        "covariate_shift_enabled": not matched_control,
+                        "covariate_shift_matched_control_enabled": matched_control,
                         "covariate_location_std": float(
-                            covariate_cfg.get("location_std", 0.25)
+                            active_cfg.get("location_std", 0.25)
                         ),
                         "covariate_log_scale_std": float(
-                            covariate_cfg.get("log_scale_std", 0.15)
+                            active_cfg.get("log_scale_std", 0.15)
                         ),
                     }
                 )
@@ -1139,8 +1255,21 @@ def run(
         feature_cfg = config.get("feature_heterogeneity", {})
         feature_masks = None
         if bool(feature_cfg.get("enabled", False)):
-            with log_stage(logger, "Build feature heterogeneity masks"):
-                feature_masks = build_feature_masks(
+            shared_private_selection = bool(
+                feature_cfg.get("shared_private_selection", False)
+            )
+            mask_builder = (
+                build_feature_masks_matched_control
+                if shared_private_selection
+                else build_feature_masks
+            )
+            stage_label = (
+                "Build matched-control (shared) feature heterogeneity masks"
+                if shared_private_selection
+                else "Build feature heterogeneity masks"
+            )
+            with log_stage(logger, stage_label):
+                feature_masks = mask_builder(
                     features,
                     clients,
                     common_fraction=float(
@@ -1544,62 +1673,122 @@ def run(
         if bool(baseline_cfg.get("local", True)):
             method_started = time.perf_counter()
             with log_stage(logger, "Run local baseline"):
-                set_seed(seed)
-                local_selectors: dict[str, ValidationCheckpoint] = {}
-                local_callbacks: dict[str, ValidationCheckpoint] = {}
-                if bool(config.get("model_selection", {}).get("enabled", False)):
-                    for client_id in clients:
-                        client_val = val.loc[
-                            val["client_id"].astype(str) == client_id
-                        ].copy()
-                        if client_val.empty:
-                            continue
-                        client_masks = (
-                            None
-                            if feature_masks is None
-                            else {client_id: feature_masks[client_id]}
-                        )
-                        selector = _validation_selector(
-                            f"local client={client_id}",
-                            client_val,
-                            baseline_epochs,
-                            config,
-                            features,
-                            spec.target_col,
-                            spec.date_col,
-                            spec.entity_col,
-                            "client_id",
-                            device,
-                            client_masks,
-                            spec.target_date_col,
-                            logger,
-                        )
-                        if selector is not None:
-                            local_selectors[client_id] = selector
-                            local_callbacks[client_id] = selector
-                training_started = time.perf_counter()
-                local_models = train_local_models(
-                    train,
-                    model_fn,
-                    features,
-                    spec.target_col,
-                    feature_masks=feature_masks,
-                    epochs=baseline_epochs,
-                    batch_size=int(fed_cfg.get("batch_size", 512)),
-                    learning_rate=client_lr,
-                    weight_decay=float(fed_cfg.get("weight_decay", 0.0)),
-                    device=device,
-                    optimizer_name=client_optimizer,
-                    momentum=client_momentum,
-                    logger=logger,
-                    client_log_interval=local_client_log_interval,
-                    epoch_log_interval=int(logging_cfg.get("local_epoch_interval", 0)),
-                    epoch_end_callbacks=local_callbacks or None,
+                local_grid = _local_tuning_grid(
+                    baseline_cfg,
+                    client_lr,
+                    float(fed_cfg.get("weight_decay", 0.0)),
+                    selection_enabled=bool(
+                        config.get("model_selection", {}).get("enabled", False)
+                    ),
                 )
+                best_local_models: dict[str, Any] = {}
+                best_local_scores: dict[str, float] = {}
+                best_local_config: dict[str, tuple[float, float]] = {}
+                local_selectors: dict[str, ValidationCheckpoint] = {}
+                training_started = time.perf_counter()
+                for candidate_lr, candidate_wd in local_grid:
+                    set_seed(seed)
+                    candidate_selectors: dict[str, ValidationCheckpoint] = {}
+                    candidate_callbacks: dict[str, ValidationCheckpoint] = {}
+                    if bool(config.get("model_selection", {}).get("enabled", False)):
+                        for client_id in clients:
+                            client_val = val.loc[
+                                val["client_id"].astype(str) == client_id
+                            ].copy()
+                            if client_val.empty:
+                                continue
+                            client_masks = (
+                                None
+                                if feature_masks is None
+                                else {client_id: feature_masks[client_id]}
+                            )
+                            selector = _validation_selector(
+                                f"local client={client_id}",
+                                client_val,
+                                baseline_epochs,
+                                config,
+                                features,
+                                spec.target_col,
+                                spec.date_col,
+                                spec.entity_col,
+                                "client_id",
+                                device,
+                                client_masks,
+                                spec.target_date_col,
+                                logger,
+                            )
+                            if selector is not None:
+                                candidate_selectors[client_id] = selector
+                                candidate_callbacks[client_id] = selector
+                    candidate_models = train_local_models(
+                        train,
+                        model_fn,
+                        features,
+                        spec.target_col,
+                        feature_masks=feature_masks,
+                        epochs=baseline_epochs,
+                        batch_size=int(fed_cfg.get("batch_size", 512)),
+                        learning_rate=candidate_lr,
+                        weight_decay=candidate_wd,
+                        device=device,
+                        optimizer_name=client_optimizer,
+                        momentum=client_momentum,
+                        logger=logger,
+                        client_log_interval=local_client_log_interval,
+                        epoch_log_interval=int(
+                            logging_cfg.get("local_epoch_interval", 0)
+                        ),
+                        epoch_end_callbacks=candidate_callbacks or None,
+                    )
+                    for client_id, selector in candidate_selectors.items():
+                        if client_id in candidate_models:
+                            selector.restore(candidate_models[client_id])
+                    # Keep, per client, the candidate with the best validation
+                    # score. With a single candidate this reduces to the
+                    # inherited-hyperparameter behaviour.
+                    for client_id, model in candidate_models.items():
+                        selector = candidate_selectors.get(client_id)
+                        score = (
+                            float(selector.best_score)
+                            if selector is not None
+                            and np.isfinite(selector.best_score)
+                            else -np.inf
+                        )
+                        if (
+                            client_id not in best_local_models
+                            or score > best_local_scores[client_id]
+                        ):
+                            best_local_models[client_id] = model
+                            best_local_scores[client_id] = score
+                            best_local_config[client_id] = (candidate_lr, candidate_wd)
+                            if selector is not None:
+                                local_selectors[client_id] = selector
+                local_models = best_local_models
                 training_elapsed = time.perf_counter() - training_started
-                for client_id, selector in local_selectors.items():
-                    if client_id in local_models:
-                        selector.restore(local_models[client_id])
+                if len(local_grid) > 1:
+                    pd.DataFrame(
+                        [
+                            {
+                                "client_id": client_id,
+                                "selected_learning_rate": lr,
+                                "selected_weight_decay": wd,
+                                "validation_score": best_local_scores.get(
+                                    client_id, float("nan")
+                                ),
+                            }
+                            for client_id, (lr, wd) in sorted(
+                                best_local_config.items()
+                            )
+                        ]
+                    ).to_csv(
+                        output_dir / "local_selected_hyperparameters.csv", index=False
+                    )
+                    logger.info(
+                        "Local baseline tuned per client over %d candidate "
+                        "configuration(s); selections written to "
+                        "local_selected_hyperparameters.csv",
+                        len(local_grid),
+                    )
                 local_selection_history = combine_selection_histories(
                     local_selectors
                 )
@@ -2090,6 +2279,8 @@ def run(
             format_seconds(elapsed_seconds),
         )
         raise
+    finally:
+        close_logger(logger)
 
 
 def main() -> None:

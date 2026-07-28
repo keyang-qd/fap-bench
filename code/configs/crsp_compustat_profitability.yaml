@@ -1,11 +1,7 @@
 seed: 42
 device: cpu
-# Main-process threads used by centralized/local training.
 torch_num_threads: 4
 torch_num_interop_threads: 1
-
-# CPU acceleration. Four spawned workers are a conservative default for an
-# Apple-silicon MacBook Pro; lower to 2 if memory pressure becomes yellow/red.
 performance:
   cache_client_arrays: true
   parallel_clients: 4
@@ -13,7 +9,6 @@ performance:
   worker_torch_threads: 1
   prediction_batch_size: 65536
 output_dir: outputs/crsp_compustat_profitability
-
 data:
   path: /Users/keyang/qdata/data0712.parquet
   source_profile: crsp_compustat_profitability_v2
@@ -26,35 +21,28 @@ data:
   require_unique_entity_month: true
   validate_target_alignment: true
   feature_columns:
-    - gpoa_zscore
-    - roa_zscore
-    - roe_zscore
-    - roic_zscore
-    - opoa_zscore
-    - gmar_zscore
-    - fcfoa_zscore
-  # These variables are already cross-sectionally ranked and z-scored by month.
-  # profitability_simple is excluded because it is a deterministic composite of
-  # the seven inputs and would leak masked components in feature-heterogeneity tests.
+  - gpoa_zscore
+  - roa_zscore
+  - roe_zscore
+  - roic_zscore
+  - opoa_zscore
+  - gmar_zscore
+  - fcfoa_zscore
   scaling: none
-
 split:
   date_col: target_date
   train_end: 2014-12-31
   val_end: 2018-12-31
-
 universe_filter:
-  # Keep disabled in the primary specification; enable in robustness runs.
   enabled: false
   price_col: prc
   min_abs_price: null
   market_cap_col: me
   exclude_bottom_market_cap_fraction: 0.0
-  # Use NYSE breakpoints by setting this to exchcd and values to [1].
   breakpoint_exchange_col: null
-  breakpoint_exchange_values: [1]
+  breakpoint_exchange_values:
+  - 1
   min_stocks_per_month: 0
-
 partition:
   type: domain
   domain_col: sic
@@ -63,33 +51,29 @@ partition:
   drop_missing_domain: true
   missing_domain_label: MissingSIC
   persistent_entity: false
-
-# Optional row-identical universe used for fair partition comparisons.
-# Keep disabled for the legacy FF12 reference; enable it through the corrected
-# partition grid so FF12, exchange, size, and IID receive exactly the same rows.
 partition_common_universe:
   enabled: false
-  required_columns: [sic, exchcd, me]
-  finite_numeric_columns: [sic, exchcd, me]
-  positive_columns: [me]
+  required_columns:
+  - sic
+  - exchcd
+  - me
+  finite_numeric_columns:
+  - sic
+  - exchcd
+  - me
+  positive_columns:
+  - me
   ff12_sic_col: sic
-
 feature_heterogeneity:
   enabled: false
   common_fraction: 1.0
   private_fraction: 0.5
-
-# Controlled statistical stress tests. Size and label-skew perturbations are
-# fitted/applied to the training split only; covariate-shift parameters are
-# fitted from the seed/client IDs and applied consistently to all time splits.
 statistical_heterogeneity:
   enabled: false
   client_size_imbalance:
     enabled: false
     imbalance_ratio: 5.0
     min_entities_per_client: 1
-  # Uniform entity downsampling matched to the total rows produced by a
-  # requested imbalance ratio. Enable this instead of client_size_imbalance.
   client_size_matched_control:
     enabled: false
     matched_imbalance_ratio: 20.0
@@ -103,11 +87,6 @@ statistical_heterogeneity:
     enabled: false
     location_std: 0.25
     log_scale_std: 0.15
-
-# Temporal stress tests use the exact same saved participation schedule for all
-# FL algorithms in a run. Modes: random, persistent, block, or matched_random.
-# matched_random preserves the per-round active-client counts of a structured
-# reference schedule while randomizing client identity.
 temporal_heterogeneity:
   enabled: false
   mode: persistent
@@ -119,32 +98,30 @@ temporal_heterogeneity:
     min_availability: 0.25
     max_availability: 1.0
     block_fraction: 0.35
-
 model:
-  hidden_dims: [64, 32]
+  hidden_dims:
+  - 64
+  - 32
   dropout: 0.1
   batch_norm: false
-
 baselines:
   centralized: true
   centralized_masked: true
   local: true
-  # Match the number of local data passes used by FL (rounds × local_epochs).
   match_federated_local_passes: true
   epochs: null
-
 model_selection:
   enabled: true
-  # Select the test checkpoint using only the validation period.
   metric: rank_ic
   mode: max
   evaluate_every: 5
-  # Save the selected checkpoint's full validation metrics. This enables
-  # validation-only hyperparameter constraints such as minimum validation R2.
   report_selected_validation_metrics: true
-
 federated:
-  algorithms: [fedavg, fedprox, scaffold, fedadam]
+  algorithms:
+  - fedavg
+  - fedprox
+  - scaffold
+  - fedadam
   rounds: 50
   local_epochs: 1
   batch_size: 2048
@@ -154,48 +131,42 @@ federated:
   weight_decay: 0.0001
   proximal_mu: 0.01
   participation_rate: 1.0
-  server_lr: 0.01
+  server_lr: 0.003
   server_beta1: 0.9
   server_beta2: 0.99
-  server_tau: 1.0e-8
-
+  server_tau: 1.0e-08
+  server_lr_selection:
+    scope: validation_only
+    metric: validation_selected_rank_ic
+    constraint_metric: validation_selected_oos_r2_zero
+    constraint_min: -0.05
+    selected_value: 0.003
 evaluation:
   date_col: target_date
   client_col: client_id
   portfolio_quantile: 0.1
   transaction_cost_bps: 10
   periods_per_year: 12
-  # Domain benchmarks use equal-weighted within-client portfolios as the main
-  # economic result. The unconstrained pooled portfolio is still reported.
   primary_portfolio: client_neutral
-  # Local models have incomparable raw score scales across clients.
   local_global_score_calibration: percentile
   report_uncalibrated_local_global: true
-  # Evaluation-only calibration fitted on validation predictions. The raw method
-  # is still reported; an additional <method>_calibrated row is emitted.
   validation_prediction_calibration:
-    enabled: false
-    methods: [fedadam]
+    enabled: true
+    methods:
+    - fedadam
     nonnegative_slope: true
     ridge: 1.0e-12
     method_suffix: calibrated
-
 logging:
   level: INFO
   file: run.log
   console: true
   overwrite: false
-  # Baselines: log every N epochs. Set 0 to suppress epoch-level logs.
   epoch_interval: 1
-  # Local-only baseline: log every N clients.
   local_client_interval: 1
-  # Predictions: log every N clients.
   prediction_client_interval: 1
-  # Federated training: log every N communication rounds.
   round_interval: 1
-  # Set true for per-client messages inside every FL round (very verbose).
   federated_client_details: false
   federated_client_interval: 1
-  # Set >0 only when local epoch logs inside each FL client are needed.
   federated_local_epoch_interval: 0
   local_epoch_interval: 0

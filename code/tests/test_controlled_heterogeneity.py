@@ -8,6 +8,7 @@ from fapbench.partition import (
     apply_client_size_imbalance,
     apply_covariate_shift,
     apply_regression_label_skew,
+    build_covariate_shift_matched_control_parameters,
     build_covariate_shift_parameters,
     temporal_availability_report,
 )
@@ -86,6 +87,31 @@ def test_covariate_shift_parameters_apply_consistently() -> None:
         shifted_row[["x1", "x2"]].to_numpy(dtype=float),
         row[["x1", "x2"]].to_numpy(dtype=float) * scales["A"] + locations["A"],
     )
+
+
+def test_covariate_shift_matched_control_collapses_to_pooled_moments() -> None:
+    clients = ["A", "B", "C", "D"]
+    features = ["x1", "x2"]
+    locations, scales = build_covariate_shift_parameters(
+        clients, features, location_std=0.4, log_scale_std=0.25, seed=17
+    )
+    matched_locations, matched_scales = build_covariate_shift_matched_control_parameters(
+        clients, features, location_std=0.4, log_scale_std=0.25, seed=17
+    )
+    expected_location = np.mean(np.stack(list(locations.values())), axis=0)
+    expected_scale = np.exp(
+        np.mean(np.log(np.stack(list(scales.values()))), axis=0)
+    )
+    for client in clients:
+        np.testing.assert_allclose(matched_locations[client], expected_location, atol=1e-6)
+        np.testing.assert_allclose(matched_scales[client], expected_scale, atol=1e-6)
+    # Every client gets the identical shift under the matched control.
+    first = clients[0]
+    for client in clients[1:]:
+        np.testing.assert_array_equal(matched_locations[client], matched_locations[first])
+        np.testing.assert_array_equal(matched_scales[client], matched_scales[first])
+    # ...but the treatment's per-client shifts genuinely differ from each other.
+    assert not np.allclose(locations["A"], locations["B"])
 
 
 def test_persistent_temporal_schedule_is_reproducible_and_heterogeneous() -> None:

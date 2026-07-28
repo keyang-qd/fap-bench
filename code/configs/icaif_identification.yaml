@@ -1,0 +1,67 @@
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/icaif_publication/identification
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+base_overrides:
+  baselines:
+    centralized: false
+    centralized_masked: false
+    local: false
+  federated:
+    algorithms: [fedavg, scaffold, fedadam]
+    server_lr: 0.003
+grid_execution:
+  parallel_runs: 1
+  max_total_client_workers: 4
+  max_total_torch_threads: 4
+  start_method: spawn
+  parallel_child_console: false
+child_logging:
+  console: true
+  round_interval: 5
+  prediction_client_interval: 3
+# Raised from 5 to 20 seeds: this grid produces the paper's matched-control
+# contrasts, whose 95% CIs (computed from only 5 seed-level point estimates)
+# currently cross zero for every treatment. The added seeds are the same
+# i*11 pattern as the original five, extended to i=1..20.
+seeds: [11, 22, 33, 44, 55, 66, 77, 88, 99, 110, 121, 132, 143, 154, 165, 176, 187, 198, 209, 220]
+scenarios:
+  - name: size_uniform_matched_ratio_20
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_matched_control: {enabled: true, matched_imbalance_ratio: 20.0}
+        client_size_imbalance: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: false}
+  - name: size_imbalance_ratio_20_identified
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_matched_control: {enabled: false}
+        client_size_imbalance: {enabled: true, imbalance_ratio: 20.0}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: false}
+  - name: temporal_persistent_strong_identified
+    overrides:
+      temporal_heterogeneity: {enabled: true, mode: persistent, min_availability: 0.10, max_availability: 1.0}
+      federated: {participation_rate: 1.0, server_lr: 0.003}
+  - name: temporal_random_matched_persistent_strong
+    overrides:
+      temporal_heterogeneity:
+        enabled: true
+        mode: matched_random
+        matched_reference: {mode: persistent, min_availability: 0.10, max_availability: 1.0}
+      federated: {participation_rate: 1.0, server_lr: 0.003}
+  - name: temporal_block_outages_identified
+    overrides:
+      temporal_heterogeneity: {enabled: true, mode: block, block_fraction: 0.40}
+      federated: {participation_rate: 1.0, server_lr: 0.003}
+  - name: temporal_random_matched_block_outages
+    overrides:
+      temporal_heterogeneity:
+        enabled: true
+        mode: matched_random
+        matched_reference: {mode: block, block_fraction: 0.40}
+      federated: {participation_rate: 1.0, server_lr: 0.003}

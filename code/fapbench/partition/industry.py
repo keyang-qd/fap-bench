@@ -121,3 +121,34 @@ def add_ff12_column(
     else:
         data[output_col] = codes
     return data
+
+
+def sic_major_group(series: pd.Series) -> pd.Series:
+    """Two-digit SIC major group (e.g. 2834 -> 28).
+
+    Unlike ``map_sic_to_ff12``, this is a deterministic numeric truncation,
+    not a curated economic crosswalk: it does not require a hand-encoded
+    table of SIC ranges. It exists to provide a higher-cardinality,
+    unambiguous domain partition (dozens of clients rather than FF12's 12)
+    for testing whether benchmark conclusions depend on client granularity,
+    without the correctness risk of reproducing a large named-industry
+    crosswalk (e.g. Fama-French 48) from memory rather than the canonical
+    source file.
+    """
+    sic = pd.to_numeric(series, errors="coerce")
+    valid = sic.notna() & (sic >= 100) & (sic < 10000)
+    result = pd.Series(pd.NA, index=series.index, dtype="Int64")
+    result.loc[valid] = (sic.loc[valid] // 100).astype("Int64")
+    return result
+
+
+def add_sic_major_group_column(
+    frame: pd.DataFrame,
+    sic_col: str = "sic",
+    output_col: str = "sic_major_group",
+) -> pd.DataFrame:
+    if sic_col not in frame.columns:
+        raise KeyError(f"SIC column {sic_col!r} is absent.")
+    data = frame.copy()
+    data[output_col] = sic_major_group(data[sic_col]).astype("string")
+    return data

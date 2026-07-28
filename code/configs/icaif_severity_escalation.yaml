@@ -1,0 +1,128 @@
+# How much MORE severe must system-level heterogeneity be to match a data-level shift?
+#
+# The paper's headline RQ3 claim is that data-level heterogeneity widens
+# cross-client dispersion by roughly an order of magnitude more than
+# system-level heterogeneity (0.0199 for severe feature masking vs 0.0020 for
+# block outages). A reviewer's objection is that the two families are dialed on
+# incommensurable scales -- Jaccard dissimilarity, affine map parameters, an
+# imbalance ratio, a block fraction -- so nothing establishes that "severe"
+# feature masking and a 40% outage block sit at comparable points on any common
+# severity axis. As written, part of the gap could be a statement about how the
+# knobs were set rather than about federated asset pricing.
+#
+# This grid answers it the constructive way: escalate the two system-level
+# families until they DO produce measurable dispersion, then report the severity
+# multiple required. That converts a defensive claim ("system-level is smaller")
+# into a quantitative one ("system-level must be Nx more extreme to match a MILD
+# data-level shift"), which is both stronger and immune to the calibration
+# objection -- the answer is expressed in each family's own units.
+#
+# Escalation ladders, each rung paired with its own matched control so the
+# contrast keeps the identification standard used everywhere else:
+#   block outages   : block_fraction 0.40 (existing) -> 0.60 -> 0.80
+#   size imbalance  : imbalance_ratio 20 (existing)  -> 50   -> 100
+# The existing 0.40 / 20.0 rungs are already in configs/icaif_identification.yaml
+# at 20 seeds and are NOT repeated here; this grid adds only the higher rungs.
+#
+# Reference points to compare against (data-level, 20 seeds, FedAvg):
+#   covariate shift MILD = 0.0035   <- the bar the ladder has to clear
+#   feature severe       = 0.0199
+#
+# 8 scenarios x 10 seeds = 80 cells. Ten seeds rather than twenty for the same
+# reason as the capacity grid: inference is over the 60 test months, and seeds
+# only reduce estimation noise on an already-estimated contrast.
+#
+# Analyse with seed_averaged_dispersion_contrasts over the four treatment/control
+# pairs, then read off the lowest rung whose interval clears covariate-mild.
+#
+# Run:
+#   caffeinate -dims python -u scripts/run_grid.py --grid configs/icaif_severity_escalation.yaml
+#
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/icaif_publication/severity_escalation
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+base_overrides:
+  baselines:
+    centralized: false
+    centralized_masked: false
+    local: false
+  federated:
+    algorithms: [fedavg, scaffold, fedadam]
+    server_lr: 0.003
+grid_execution:
+  parallel_runs: 2
+  max_total_client_workers: 6
+  max_total_torch_threads: 6
+  start_method: spawn
+  parallel_child_console: false
+child_logging:
+  console: true
+  round_interval: 5
+  prediction_client_interval: 3
+
+seeds: [11, 22, 33, 44, 55, 66, 77, 88, 99, 110]
+
+scenarios:
+  # --- block outages, rung 2: 60% of rounds ---------------------------------
+  - name: temporal_block_outages_060
+    overrides:
+      temporal_heterogeneity: {enabled: true, mode: block, block_fraction: 0.60}
+      federated: {participation_rate: 1.0, server_lr: 0.003}
+  - name: temporal_random_matched_block_060
+    overrides:
+      temporal_heterogeneity:
+        enabled: true
+        mode: matched_random
+        matched_reference: {mode: block, block_fraction: 0.60}
+      federated: {participation_rate: 1.0, server_lr: 0.003}
+
+  # --- block outages, rung 3: 80% of rounds ---------------------------------
+  - name: temporal_block_outages_080
+    overrides:
+      temporal_heterogeneity: {enabled: true, mode: block, block_fraction: 0.80}
+      federated: {participation_rate: 1.0, server_lr: 0.003}
+  - name: temporal_random_matched_block_080
+    overrides:
+      temporal_heterogeneity:
+        enabled: true
+        mode: matched_random
+        matched_reference: {mode: block, block_fraction: 0.80}
+      federated: {participation_rate: 1.0, server_lr: 0.003}
+
+  # --- size imbalance, rung 2: 50:1 -----------------------------------------
+  - name: size_imbalance_ratio_50
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_matched_control: {enabled: false}
+        client_size_imbalance: {enabled: true, imbalance_ratio: 50.0}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: false}
+  - name: size_uniform_matched_ratio_50
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_matched_control: {enabled: true, matched_imbalance_ratio: 50.0}
+        client_size_imbalance: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: false}
+
+  # --- size imbalance, rung 3: 100:1 ----------------------------------------
+  - name: size_imbalance_ratio_100
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_matched_control: {enabled: false}
+        client_size_imbalance: {enabled: true, imbalance_ratio: 100.0}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: false}
+  - name: size_uniform_matched_ratio_100
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_matched_control: {enabled: true, matched_imbalance_ratio: 100.0}
+        client_size_imbalance: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: false}

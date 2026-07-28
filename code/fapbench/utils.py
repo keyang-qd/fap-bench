@@ -139,6 +139,24 @@ def configure_logger(
     return logger
 
 
+def close_logger(logger: logging.Logger) -> None:
+    """Flush and close every handler owned by a per-run logger.
+
+    Grid execution creates a distinct logger name for each output directory so
+    concurrent runs never write into one another's files.  Python's logging
+    manager retains those logger objects for the life of the interpreter;
+    without explicit cleanup, every completed run leaves its ``FileHandler``
+    open.  Long publication grids can therefore hit macOS's soft file-
+    descriptor limit while spawning the next client worker process.
+    """
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        try:
+            handler.flush()
+        finally:
+            handler.close()
+
+
 @contextmanager
 def log_stage(logger: logging.Logger, name: str) -> Iterator[None]:
     """Log stage start, completion time, and exception traceback."""

@@ -1,0 +1,101 @@
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/icaif_publication/heterogeneity
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+base_overrides:
+  baselines:
+    centralized: true
+    centralized_masked: true
+    local: false
+  federated:
+    algorithms: [fedavg, scaffold, fedadam]
+    server_lr: 0.003
+# parallel_runs=2 (with worker/thread caps raised accordingly) runs two
+# scenario+seed cells concurrently instead of strictly sequentially; this
+# disables preload_panel_once (each concurrent run loads its own ~2.3GB panel
+# copy instead of sharing one), which is cheap per run (~1.2s to load) and
+# fits comfortably in this machine's 16GB RAM at parallel_runs=2.
+grid_execution:
+  parallel_runs: 2
+  max_total_client_workers: 6
+  max_total_torch_threads: 6
+  start_method: spawn
+  parallel_child_console: false
+child_logging:
+  console: true
+  round_interval: 5
+  epoch_interval: 5
+  prediction_client_interval: 3
+# Raised from 5 to 20 seeds, the same i*11 pattern as identification's own
+# 5->20 bump: this grid now also carries matched-control comparisons
+# (covariate_shift_*_matched, feature_heterogeneity_*_matched below), and
+# matched-control contrasts are exactly the case identification's own seed
+# increase was motivated by (5-seed CIs crossed zero for every treatment
+# there). All 10 scenarios in this file -- the 5 original treatments and the
+# 5 new matched controls -- share this seed list, since the matched-control
+# HAC test only uses seeds common to both sides of a comparison.
+seeds: [11, 22, 33, 44, 55, 66, 77, 88, 99, 110, 121, 132, 143, 154, 165, 176, 187, 198, 209, 220]
+scenarios:
+  - name: covariate_shift_mild
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance: {enabled: false}
+        client_size_matched_control: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: true, location_std: 0.15, log_scale_std: 0.10}
+        covariate_shift_matched_control: {enabled: false}
+  - name: covariate_shift_strong
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance: {enabled: false}
+        client_size_matched_control: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: true, location_std: 0.50, log_scale_std: 0.30}
+        covariate_shift_matched_control: {enabled: false}
+  # Matched control for covariate_shift_mild: same location_std/log_scale_std
+  # (so build_covariate_shift_matched_control_parameters collapses the same
+  # draws), applied identically to every client instead of independently per
+  # client. See fapbench/partition/statistical.py.
+  - name: covariate_shift_mild_matched
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance: {enabled: false}
+        client_size_matched_control: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: false}
+        covariate_shift_matched_control: {enabled: true, location_std: 0.15, log_scale_std: 0.10}
+  - name: covariate_shift_strong_matched
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance: {enabled: false}
+        client_size_matched_control: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: false}
+        covariate_shift_matched_control: {enabled: true, location_std: 0.50, log_scale_std: 0.30}
+  - name: feature_heterogeneity_mild
+    overrides:
+      feature_heterogeneity: {enabled: true, common_fraction: 0.70, private_fraction: 0.70, shared_private_selection: false}
+  - name: feature_heterogeneity_moderate
+    overrides:
+      feature_heterogeneity: {enabled: true, common_fraction: 0.50, private_fraction: 0.50, shared_private_selection: false}
+  - name: feature_heterogeneity_severe
+    overrides:
+      feature_heterogeneity: {enabled: true, common_fraction: 0.15, private_fraction: 0.35, shared_private_selection: false}
+  # Matched controls for feature heterogeneity: same common_fraction/private_fraction
+  # as their treatment counterparts, but shared_private_selection=true draws the
+  # private feature subset once and applies it to every client instead of
+  # independently per client. See fapbench/partition/feature.py.
+  - name: feature_heterogeneity_mild_matched
+    overrides:
+      feature_heterogeneity: {enabled: true, common_fraction: 0.70, private_fraction: 0.70, shared_private_selection: true}
+  - name: feature_heterogeneity_moderate_matched
+    overrides:
+      feature_heterogeneity: {enabled: true, common_fraction: 0.50, private_fraction: 0.50, shared_private_selection: true}
+  - name: feature_heterogeneity_severe_matched
+    overrides:
+      feature_heterogeneity: {enabled: true, common_fraction: 0.15, private_fraction: 0.35, shared_private_selection: true}

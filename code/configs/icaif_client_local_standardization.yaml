@@ -1,0 +1,89 @@
+# Does RQ3's dispersion effect survive client-local standardization?
+#
+# Why this exists
+# ---------------
+# The benchmark's default preprocessing is a within-month rank-then-z-score over
+# the FULL cross-section, computed at panel construction, before clients exist.
+# It is look-ahead-safe, but it is global across clients -- and the paper's
+# premise is that raw data cannot be pooled, so no client in the stated
+# deployment could compute it.
+#
+# A reviewer called this the paper's most serious weakness, and the objection is
+# specific rather than aesthetic: RQ3's dependent variable IS cross-client
+# dispersion, so a preprocessing step that equalizes clients' feature
+# distributions is a candidate explanation for the headline finding that the
+# system-level footprint is an order of magnitude smaller. Disclosing it is not
+# enough; it has to be measured.
+#
+# This grid re-runs the largest data-level contrast -- severe feature
+# heterogeneity and its matched control -- with each client standardizing its own
+# monthly cross-section (data.client_local_standardization). Everything else is
+# copied verbatim from configs/icaif_heterogeneity.yaml, so preprocessing is the
+# only thing that differs from the published contrast.
+#
+# Either outcome is reportable, and that is the point of running it:
+#   - a comparable effect  => the finding is not an artifact of pooled
+#                             preprocessing, and the objection is answered for
+#                             the effect that carries the claim;
+#   - a much larger effect => global standardization was suppressing dispersion,
+#                             and the paper must say the reported magnitudes are
+#                             a lower bound;
+#   - a much smaller one   => the effect depends on shared preprocessing, which
+#                             is a real scope limit and must be stated.
+#
+# Note this is NOT the same knob as the covariate-shift treatment. That perturbs
+# each client's features by an affine map and asks what structure does; this
+# changes who computes the normalizing statistics.
+#
+# 2 scenarios x 10 seeds = 20 cells. Ten seeds because inference is over the 60
+# test months and this confirms an already-estimated contrast; the published
+# number uses 20 seeds, so the comparison crosses seed sets -- the same caveat
+# the manuscript already states for its unmatched ratios.
+#
+# Run:
+#   caffeinate -dims python -u scripts/run_grid.py --grid configs/icaif_client_local_standardization.yaml
+
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/icaif_publication/client_local_standardization
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+
+base_overrides:
+  data:
+    # The whole point of this grid. Applied after client assignment and before
+    # the train/val/test split, so every split sees the same transform.
+    client_local_standardization: true
+  # Copied from icaif_heterogeneity.yaml. centralized_masked is required: it is
+  # the baseline separating information removal from federated coordination.
+  baselines:
+    centralized: true
+    centralized_masked: true
+    local: false
+  federated:
+    algorithms: [fedavg, scaffold, fedadam]
+    server_lr: 0.003
+
+grid_execution:
+  parallel_runs: 2
+  max_total_client_workers: 6
+  max_total_torch_threads: 6
+  start_method: spawn
+  parallel_child_console: false
+
+child_logging:
+  console: true
+  round_interval: 5
+  epoch_interval: 5
+
+seeds: [11, 22, 33, 44, 55, 66, 77, 88, 99, 110]
+
+scenarios:
+  # Verbatim from icaif_heterogeneity.yaml's severe pair; shared_private_selection
+  # is the only difference between them, exactly as in the published contrast.
+  - name: feature_heterogeneity_severe
+    overrides:
+      feature_heterogeneity: {enabled: true, common_fraction: 0.15, private_fraction: 0.35, shared_private_selection: false}
+  - name: feature_heterogeneity_severe_matched
+    overrides:
+      feature_heterogeneity: {enabled: true, common_fraction: 0.15, private_fraction: 0.35, shared_private_selection: true}

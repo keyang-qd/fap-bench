@@ -104,3 +104,44 @@ def test_universe_filter_supports_price_and_nyse_microcap_breakpoints():
     assert filtered["prc"].abs().min() >= 5.0
     assert filtered.groupby("date")["me"].min().min() >= 2.5
     assert report["n_rows_dropped"] > 0
+
+
+def test_split_by_time_test_end_truncates_the_panel():
+    """test_end must drop later rows, not reassign them.
+
+    Rolling refits rely on this: each window tests exactly one step past its
+    validation block, so windows concatenate into one continuous out-of-sample
+    series with no month counted twice.
+    """
+    import pandas as pd
+    import pytest
+
+    from fapbench.data import split_by_time
+
+    frame = pd.DataFrame(
+        {"target_date": pd.date_range("2015-01-31", periods=72, freq="ME"), "x": 1.0}
+    )
+    full = split_by_time(
+        frame, "target_date", train_end="2016-12-31", val_end="2017-12-31"
+    )
+    capped = split_by_time(
+        frame,
+        "target_date",
+        train_end="2016-12-31",
+        val_end="2017-12-31",
+        test_end="2018-12-31",
+    )
+    assert full["split"].eq("test").sum() == 36        # 2018-01 .. 2020-12
+    assert capped["split"].eq("test").sum() == 12      # 2018 only
+    assert capped["target_date"].max() == pd.Timestamp("2018-12-31")
+    # train/val blocks are untouched by the cap
+    for name in ("train", "val"):
+        assert full["split"].eq(name).sum() == capped["split"].eq(name).sum()
+    with pytest.raises(ValueError, match="later than val_end"):
+        split_by_time(
+            frame,
+            "target_date",
+            train_end="2016-12-31",
+            val_end="2017-12-31",
+            test_end="2017-06-30",
+        )

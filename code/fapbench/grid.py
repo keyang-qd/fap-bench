@@ -16,19 +16,49 @@ from fapbench.config import deep_update, load_config
 from fapbench.data import load_panel
 from fapbench.runner import resolve_data_path, run
 from fapbench.utils import (
+    close_logger,
     configure_logger,
     ensure_dir,
     format_seconds,
     frame_memory_mb,
+    json_default,
     log_stage,
     write_json,
 )
 
 
-def _completed_run_files(output_dir: Path) -> bool:
-    """Return True only when the files needed for grid aggregation exist."""
+def _resume_relevant_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return a canonical experiment config for resumability checks.
+
+    ``yaml.safe_load`` represents unquoted dates as :class:`datetime.date`, while
+    ``resolved_config.json`` necessarily stores those values as ISO strings. A
+    direct dictionary comparison therefore rejected every completed run even when
+    its configuration was unchanged. Canonicalizing through JSON applies the same
+    conversions used by :func:`write_json` before comparing the configurations.
+
+    Output locations and logging verbosity do not change an experiment. Everything
+    else, including data path, partition, methods, seeds, and FedAdam server LR,
+    must match before a completed directory may be reused.
+    """
+    ignored = {"_config_path", "output_dir", "logging"}
+    relevant = {key: value for key, value in config.items() if key not in ignored}
+    return json.loads(
+        json.dumps(
+            relevant,
+            default=json_default,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
+def _completed_run_files(
+    output_dir: Path, expected_config: dict[str, Any] | None = None
+) -> bool:
+    """Return True only when complete outputs match the requested configuration."""
     results_path = output_dir / "benchmark_results.csv"
     heterogeneity_path = output_dir / "heterogeneity.json"
+    resolved_config_path = output_dir / "resolved_config.json"
     if not results_path.exists() or not heterogeneity_path.exists():
         return False
     try:
@@ -37,6 +67,15 @@ def _completed_run_files(output_dir: Path) -> bool:
             return False
         with heterogeneity_path.open("r", encoding="utf-8") as handle:
             json.load(handle)
+        if expected_config is not None:
+            if not resolved_config_path.exists():
+                return False
+            with resolved_config_path.open("r", encoding="utf-8") as handle:
+                completed_config = json.load(handle)
+            if _resume_relevant_config(completed_config) != _resume_relevant_config(
+                expected_config
+            ):
+                return False
     except Exception:
         return False
     return True
@@ -372,7 +411,9 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
     try:
         pending: list[dict[str, Any]] = []
         for cell in cells:
-            if resume_completed and _completed_run_files(cell["run_dir"]):
+            if resume_completed and _completed_run_files(
+                cell["run_dir"], expected_config=cell["config"]
+            ):
                 record_success(cell, cell["run_dir"], "reused_completed", 0.0)
             else:
                 pending.append(cell)
@@ -480,6 +521,9 @@ def run_grid(grid_config: dict[str, Any]) -> Path:
             format_seconds(time.perf_counter() - started),
         )
         raise
+    finally:
+        close_logger(logger)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run multiple FAP-Bench scenarios and seeds.")

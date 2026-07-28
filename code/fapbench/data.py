@@ -390,14 +390,30 @@ def split_by_time(
     date_col: str,
     train_end: str | None = None,
     val_end: str | None = None,
+    test_end: str | None = None,
     ratios: Sequence[float] = (0.6, 0.2, 0.2),
 ) -> pd.DataFrame:
+    """Chronological train/val/test split.
+
+    ``test_end`` truncates the panel: rows dated after it are dropped entirely
+    rather than assigned to a split. The single-window protocol leaves it None
+    so test runs to the end of the data. Rolling refits set it so each window
+    tests exactly one step ahead of its validation block, which is what makes a
+    grid of windows concatenate into one continuous out-of-sample series.
+    """
     if date_col not in frame.columns:
         raise KeyError(f"Split date column {date_col!r} is absent from the panel.")
     data = frame.copy()
     data[date_col] = pd.to_datetime(data[date_col], errors="coerce")
     if data[date_col].isna().any():
         raise ValueError(f"Split date column {date_col!r} contains missing/invalid values.")
+    if test_end is not None:
+        test_boundary = pd.Timestamp(test_end)
+        if val_end is not None and test_boundary <= pd.Timestamp(val_end):
+            raise ValueError("test_end must be later than val_end.")
+        data = data.loc[data[date_col] <= test_boundary].copy()
+        if data.empty:
+            raise ValueError(f"No rows remain on or before test_end={test_end!r}.")
     dates = np.array(sorted(data[date_col].unique()))
     if len(dates) < 3:
         raise ValueError(
@@ -609,3 +625,59 @@ def apply_universe_filters(
     if data.empty:
         raise ValueError("Universe filters removed every observation.")
     return data.reset_index(drop=True), report
+
+
+def client_local_rank_zscore(
+    frame: pd.DataFrame,
+    feature_columns: Iterable[str],
+    *,
+    client_col: str = "client_id",
+    date_col: str = "date",
+) -> pd.DataFrame:
+    """Re-standardize each feature within (client, month) instead of panel-wide.
+
+    The benchmark's default standardization is a within-month rank-then-z-score
+    over the *full* cross-section, computed at panel construction. That is
+    look-ahead-safe but global across clients, which sits awkwardly with the
+    premise that raw data cannot be pooled: no client in the stated deployment
+    could compute it. Because RQ3's dependent variable is cross-client
+    dispersion, a preprocessing step that equalizes clients' feature
+    distributions is a candidate explanation for its own headline, so the
+    benchmark has to be able to run without it.
+
+    This applies the same rank-then-z-score restricted to one client's own
+    monthly cross-section. Two properties make it the right comparison:
+
+    * Ranking is invariant to monotone transforms, and every step upstream
+      (the panel's global rank-z-score, then PanelPreprocessor's affine
+      train-statistic scaling) is monotone within a month. Re-ranking those
+      values inside a client therefore gives exactly what ranking the raw
+      characteristics inside that client would have given -- so this is a
+      genuine client-local statistic, not a re-scaling of a pooled one.
+    * It uses only the client's own contemporaneous cross-section, so it stays
+      look-ahead-safe on the same terms as the global version.
+
+    A client-month with fewer than two usable observations for a feature has no
+    cross-section to rank, and its value is set to 0.0 (the mean of any
+    standardized column) rather than dropped, so client sample sizes are
+    unchanged and the size-imbalance treatments stay comparable.
+    """
+    columns = [column for column in feature_columns if column in frame.columns]
+    if not columns:
+        return frame
+    if client_col not in frame.columns:
+        raise KeyError(
+            f"client_local_rank_zscore needs the client column {client_col!r}; "
+            "it must run after client assignment."
+        )
+    data = frame.copy()
+    grouped = data.groupby([data[client_col], data[date_col]], sort=False)
+    for column in columns:
+        ranks = grouped[column].rank(method="average")
+        # Standardize the ranks within the same groups.
+        rank_groups = ranks.groupby([data[client_col], data[date_col]], sort=False)
+        mean = rank_groups.transform("mean")
+        std = rank_groups.transform("std", ddof=0)
+        standardized = (ranks - mean) / std.replace(0.0, np.nan)
+        data[column] = standardized.fillna(0.0).clip(-10.0, 10.0)
+    return data

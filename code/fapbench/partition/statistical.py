@@ -220,6 +220,44 @@ def build_covariate_shift_parameters(
     return locations, scales
 
 
+def build_covariate_shift_matched_control_parameters(
+    client_ids: Iterable[str],
+    feature_names: Iterable[str],
+    *,
+    location_std: float = 0.0,
+    log_scale_std: float = 0.0,
+    seed: int = 42,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Matched control for build_covariate_shift_parameters.
+
+    Reuses the identical per-client draws as the treatment (same seed,
+    location_std, log_scale_std -- required, not incidental, for the match to
+    hold) and collapses them to one shared affine transform applied
+    identically to every client: the arithmetic mean of the realized
+    locations (additive term) and the geometric mean of the realized scales
+    (multiplicative/lognormal term). This matches the treatment's realized
+    pooled first moment exactly, not just its distributional family, while
+    zeroing cross-client dispersion in the shift.
+    """
+    locations, scales = build_covariate_shift_parameters(
+        client_ids,
+        feature_names,
+        location_std=location_std,
+        log_scale_std=log_scale_std,
+        seed=seed,
+    )
+    mean_location = (
+        np.stack(list(locations.values())).astype(np.float64).mean(axis=0).astype(np.float32)
+    )
+    mean_scale = np.exp(
+        np.log(np.stack(list(scales.values())).astype(np.float64)).mean(axis=0)
+    ).astype(np.float32)
+    return (
+        {client: mean_location.copy() for client in locations},
+        {client: mean_scale.copy() for client in locations},
+    )
+
+
 def apply_covariate_shift(
     frame: pd.DataFrame,
     feature_names: Iterable[str],
