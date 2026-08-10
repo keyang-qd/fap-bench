@@ -199,11 +199,18 @@ def test_no_stale_research_question_labels_in_typeset_sources():
     the check is repointed rather than dropped, and it still covers the original
     bug: restore RQ headers and the consecutive check applies again.
     """
+    import os
     import re
     from pathlib import Path
 
-    paper = Path("/Users/keyang/paper-fap-bench")
-    if not paper.exists():  # code repo may be checked out alone
+    # The manuscript lives outside this repo. Never hardcode a home-directory
+    # path here: this file ships in the anonymized release, where a real
+    # username is a double-blind leak. Look beside the repo, or take an
+    # override, and skip when neither is there.
+    env = os.environ.get("FAPBENCH_PAPER_DIR")
+    candidates = [Path(env)] if env else [ROOT.parent.parent / "paper-fap-bench", ROOT.parent / "paper-fap-bench"]
+    paper = next((p for p in candidates if p.exists()), None)
+    if paper is None:  # code repo may be checked out alone
         return
 
     experiment = (paper / "inputs" / "experiment.tex").read_text()
