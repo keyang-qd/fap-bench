@@ -183,3 +183,50 @@ def test_local_tuning_requires_validation_selection():
         )
     # disabled tuning is unaffected by the selection setting
     assert _local_tuning_grid({}, 0.01, 0.0, selection_enabled=False) == [(0.01, 0.0)]
+
+
+def test_no_stale_research_question_labels_in_typeset_sources():
+    """No visible "RQ<n>" may name a section the manuscript does not have.
+
+    The bug this originally guarded: cutting a research question renumbered the
+    rest, and a generated caption kept saying "(RQ2)" for what had become RQ1.
+    The audit checks numbers, not labels, so nothing caught it.
+
+    The manuscript has since replaced RQ headers with descriptive section
+    titles, which voids the old invariant (headers consecutive from RQ1, intro
+    announcing the count) but not the failure mode -- it inverts it. With no RQ
+    sections left, any surviving "RQ<n>" a reader can see points at nothing. So
+    the check is repointed rather than dropped, and it still covers the original
+    bug: restore RQ headers and the consecutive check applies again.
+    """
+    import re
+    from pathlib import Path
+
+    paper = Path("/Users/keyang/paper-fap-bench")
+    if not paper.exists():  # code repo may be checked out alone
+        return
+
+    experiment = (paper / "inputs" / "experiment.tex").read_text()
+    headers = re.findall(r"\\(?:subsection|paragraph)\{(RQ\d): ([^?]+)\?\}", experiment)
+
+    if headers:
+        numbers = [h[0] for h in headers]
+        assert numbers == sorted(set(numbers), key=numbers.index), "duplicate RQ labels"
+        assert numbers == [f"RQ{i}" for i in range(1, len(numbers) + 1)], (
+            f"RQ headers must be consecutive from RQ1; got {numbers}"
+        )
+        return
+
+    # \label/\ref keys are internal identifiers and never render, so a key
+    # named sec:rq2 is fine; anything a reader sees is not.
+    sources = sorted((paper / "inputs").glob("*.tex")) + sorted((paper / "tables").glob("*.tex"))
+    offenders = []
+    for path in sources:
+        for line in path.read_text().splitlines():
+            visible = re.sub(r"\\(?:label|ref|eqref)\{[^}]*\}", "", line)
+            if re.search(r"\bRQ\d", visible):
+                offenders.append(f"{path.name}: {line.strip()[:90]}")
+    assert not offenders, (
+        "manuscript has no RQ sections, but these still name one:\n  "
+        + "\n  ".join(offenders)
+    )

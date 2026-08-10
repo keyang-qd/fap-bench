@@ -112,3 +112,52 @@ def test_federated_trainer_uses_supplied_client_schedule() -> None:
     trainer.fit(frame, client_schedule=schedule)
     history = trainer.history.to_frame()
     assert history["active_clients"].tolist() == [1, 2]
+
+
+def test_fedprox_proximal_term_changes_the_trained_client():
+    """A reviewer asked whether FedProx's proximal term does anything at all.
+
+    FedProx tracks FedAvg to five decimals in the reported table, which is
+    consistent with either a correct implementation in a regime where client drift
+    is small (one local epoch, so there is little drift to penalize) or a silently
+    inert penalty. This distinguishes them by running the real client-training path
+    twice on identical data and seeds, changing only mu: a live penalty must move
+    the trained parameters, and a large mu must hold them closer to the global point
+    than a small one.
+    """
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from fapbench.algorithms.common import train_one_client
+
+    torch.manual_seed(0)
+    x = torch.randn(64, 4)
+    y = (x @ torch.tensor([1.0, -0.5, 0.25, 0.0])).unsqueeze(1)
+    loader = DataLoader(TensorDataset(x, y), batch_size=16, shuffle=False)
+    model_fn = partial(AssetPricingMLP, input_dim=4, hidden_dims=(8,))
+    global_state = {k: v.clone() for k, v in model_fn().state_dict().items()}
+
+    def train(mu: float) -> dict[str, torch.Tensor]:
+        torch.manual_seed(0)
+        model, _ = train_one_client(
+            model_fn,
+            global_state,
+            loader,
+            torch.device("cpu"),
+            local_epochs=5,
+            learning_rate=0.1,
+            proximal_mu=mu,
+        )
+        return {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    def distance_from_global(state) -> float:
+        return float(
+            sum(torch.sum((state[k] - global_state[k]) ** 2) for k in global_state)
+        )
+
+    plain, penalized = train(0.0), train(1.0)
+    # The penalty must actually change the result...
+    assert any(
+        not torch.allclose(plain[k], penalized[k]) for k in plain
+    ), "mu had no effect: the proximal term is inert"
+    # ...and in the direction the penalty defines.
+    assert distance_from_global(penalized) < distance_from_global(plain)

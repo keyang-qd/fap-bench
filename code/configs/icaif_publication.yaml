@@ -9,6 +9,82 @@ phases:
   - {name: identification, grid: icaif_identification.yaml}
   - {name: label_diagnostics, grid: icaif_label_diagnostics.yaml}
   - {name: core_expanded_features, grid: icaif_core_expanded_features.yaml}
+# Grids that answer specific reviewer objections rather than producing the
+# headline tables. They are kept out of `phases` because running them takes an
+# order of magnitude longer than the seven above and none of the main tables needs
+# them -- their publication tables are written empty until the grid exists. Run
+# them with `--include-extended` (all of them) or `--only <name>` (one).
+#
+# Listing them here rather than only in the README is what makes the paper's
+# "regenerate every table from one command" claim literally true: this file is the
+# complete manifest of grids the manuscript draws on.
+extended_phases:
+  - {name: robustness, grid: icaif_robustness.yaml}
+  - {name: rolling_refit, grid: icaif_rolling_refit.yaml}
+  - {name: capacity_separation, grid: icaif_capacity_separation.yaml}
+  - {name: linear_separation, grid: icaif_linear_separation.yaml}
+  - {name: rq3_investable, grid: icaif_rq3_investable.yaml}
+  - {name: severity_escalation, grid: icaif_severity_escalation.yaml}
+  - {name: client_local_standardization, grid: icaif_client_local_standardization.yaml}
+  - {name: linear_investable, grid: icaif_linear_investable.yaml}
+  - {name: ensemble_local, grid: icaif_ensemble_local.yaml}
+  # The expanding-window refits behind the investable screen. Separate from
+  # `rolling_refit` because the two universes are not comparable in levels and
+  # must not share an output directory; this one answers whether the reference
+  # protocol's nulls are a power limit, which the unrestricted refits cannot.
+  - {name: rolling_refit_investable, grid: icaif_rolling_refit_investable.yaml}
+  # RQ3's matched-control pairs refit over expanding windows, so the dispersion
+  # contrasts are tested on ~408 months rather than the reference protocol's 60.
+  # This is the RQ3 counterpart to `rolling_refit_investable`: the same power
+  # argument, applied to the claims the paper actually leads with.
+  - {name: rq3_rolling, grid: icaif_rq3_rolling.yaml}
+  # Client-local preprocessing applied to the headline LEVELS, not just to RQ3's
+  # dispersion contrast. Answers whether Table 3 and the universe lever survive a
+  # normalization a real federation could actually compute.
+  - {name: client_local_levels, grid: icaif_client_local_levels.yaml}
+  # The variance-matched covariate-shift control. Bounds how much of the
+  # data-level effect is control strictness rather than cross-client structure.
+  - {name: second_moment_control, grid: icaif_second_moment_control.yaml}
+  # The personalized arm: per-client fine-tuning of the converged FedAvg model.
+  # Bounds whether the reported per-client cost is intrinsic to heterogeneity or
+  # a consequence of the single-global-model scope.
+  - {name: finetune_baseline, grid: icaif_finetune_baseline.yaml}
+  # Stage 1 of the wide-panel re-tuning check: selects architecture and client
+  # learning rate at 20 characteristics on validation only, so the paper's
+  # "recipe fails to transfer" reading of the untuned arm can be tested rather
+  # than asserted.
+  - {name: expanded_capacity_sweep, grid: icaif_expanded_capacity_sweep.yaml}
+  # ICAIF revision additions. Extended (opt-in), not default: each is either a
+  # full 34-window refit or a 20-characteristic grid, so folding them into the
+  # default list would turn the documented one-command publication run from hours
+  # into days. They answer the review round's central objection -- that the
+  # reference configuration has too little signal for its nulls to be
+  # informative -- so they must be reproducible, but on request.
+  - {name: expanded_tuned, grid: icaif_expanded_tuned.yaml}
+  - {name: rolling_refit_linear, grid: icaif_rolling_refit_linear.yaml}
+  - {name: rolling_refit_investable_tuned20, grid: icaif_rolling_refit_investable_tuned20.yaml}
+  # Federation-feasible preprocessing on both 408-month cells. A reviewer
+  # objected that the paper shows the feasible alternative only in the
+  # 60-month cell it has itself declared non-rankable. Not yet run.
+  - {name: rolling_refit_investable_clientlocal, grid: icaif_rolling_refit_investable_clientlocal.yaml}
+  - {name: rolling_refit_investable_tuned20_clientlocal, grid: icaif_rolling_refit_investable_tuned20_clientlocal.yaml}
+  # The widened cell's panel and universe with the model class swapped to
+  # linear/ridge: the only arm that can say whether the coordination cost this
+  # benchmark measures is a property of federating or of the non-convex model it
+  # is measured on. Cheap next to its MLP sibling -- a linear model over the same
+  # 34 windows -- so it is extended rather than default only because it answers a
+  # caveat rather than producing a headline table.
+  - {name: rolling_refit_investable_linear_tuned20, grid: icaif_rolling_refit_investable_linear_tuned20.yaml}
+  # The server-rate sweep repeated on the widened panel. It tests the one
+  # assumption holding up the paper's only result that clears its own floor:
+  # that FedAdam's un-re-selected server rate handicaps it rather than happening
+  # to suit 20 characteristics. Validation-only, so it cannot move an economic
+  # number either way.
+  - {name: fedadam_validation_tuned20, grid: icaif_fedadam_validation_tuned20.yaml}
+  - {name: rq2_tuned20, grid: icaif_rq2_tuned20.yaml}
+  - {name: dp_sweep, grid: icaif_dp_sweep.yaml}
+  - {name: rolling_refit_investable_tuned20_dp0, grid: icaif_rolling_refit_investable_tuned20_dp0.yaml}
+  - {name: rolling_refit_investable_tuned20_dp4, grid: icaif_rolling_refit_investable_tuned20_dp4.yaml}
 selection:
   phase: fedadam_validation
   scenario_prefix: fedadam_validation_lr_

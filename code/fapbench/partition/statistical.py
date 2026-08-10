@@ -258,6 +258,84 @@ def build_covariate_shift_matched_control_parameters(
     )
 
 
+def build_covariate_shift_second_moment_matched_control_parameters(
+    client_ids: Iterable[str],
+    feature_names: Iterable[str],
+    *,
+    location_std: float = 0.0,
+    log_scale_std: float = 0.0,
+    seed: int = 42,
+    base_mean: float = 0.0,
+    base_std: float = 1.0,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """A strictly tighter matched control: matches the pooled mean AND variance.
+
+    Why this exists
+    ---------------
+    Four reviewers independently made the same objection, and it is the sharpest
+    one the paper received. The headline RQ3 claim compares a data-level effect
+    against a system-level effect whose controls are not equally strict: the
+    temporal controls match the row and column sums of ``A`` exactly, while
+    ``build_covariate_shift_matched_control_parameters`` matches only the pooled
+    *first* moment. A gap between a family controlled exactly and a family
+    controlled on one moment is precisely what looser control would manufacture,
+    so the 10x separation is a bound of unstated width rather than an estimate.
+
+    This closes the gap by construction. The treatment gives client k the map
+    ``x_k = a_k + b_k x``. Because standardization happens globally at panel
+    construction, before clients exist, every client's pre-transform feature
+    distribution shares a mean ``mu`` and variance ``sigma^2``, so the treatment's
+    equal-weighted pooled moments are available in closed form:
+
+        m_T = mean_k(a_k) + mean_k(b_k) * mu
+        E[x^2]_T = mean_k(a_k^2 + 2 a_k b_k mu + b_k^2 (sigma^2 + mu^2))
+        v_T = E[x^2]_T - m_T^2
+
+    A control applying one shared map to every client has pooled mean
+    ``abar + bbar*mu`` and pooled variance ``bbar^2 sigma^2``, so requiring both to
+    equal the treatment's gives
+
+        bbar = sqrt(v_T) / sigma,    abar = m_T - bbar * mu
+
+    Note ``v_T`` contains the cross-client dispersion of ``a_k`` and ``b_k``: the
+    shared scale absorbs it. That is exactly what makes this control tighter --
+    more of the treatment's aggregate footprint is reproduced, so the residual
+    (treatment minus control) is a smaller and better-identified quantity. If the
+    effect survives, the claim upgrades from a bound to an estimate; if it
+    collapses, the gap was control strictness and that is the more important
+    result. Both outcomes are reportable, which is the point of running it.
+
+    ``base_mean``/``base_std`` default to the rank-then-z-score convention the
+    benchmark uses. They are parameters rather than constants so the derivation
+    stays valid if the preprocessing changes.
+    """
+    if base_std <= 0:
+        raise ValueError("base_std must be positive.")
+    locations, scales = build_covariate_shift_parameters(
+        client_ids,
+        feature_names,
+        location_std=location_std,
+        log_scale_std=log_scale_std,
+        seed=seed,
+    )
+    a = np.stack(list(locations.values())).astype(np.float64)  # (K, F)
+    b = np.stack(list(scales.values())).astype(np.float64)
+
+    mu, sigma = float(base_mean), float(base_std)
+    pooled_mean = a.mean(axis=0) + b.mean(axis=0) * mu
+    pooled_second = (a**2 + 2.0 * a * b * mu + b**2 * (sigma**2 + mu**2)).mean(axis=0)
+    pooled_variance = np.maximum(pooled_second - pooled_mean**2, 0.0)
+
+    shared_scale = np.sqrt(pooled_variance) / sigma
+    shared_location = pooled_mean - shared_scale * mu
+    shared_scale = shared_scale.astype(np.float32)
+    shared_location = shared_location.astype(np.float32)
+    return (
+        {client: shared_location.copy() for client in locations},
+        {client: shared_scale.copy() for client in locations},
+    )
+
+
 def apply_covariate_shift(
     frame: pd.DataFrame,
     feature_names: Iterable[str],

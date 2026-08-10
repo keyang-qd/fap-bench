@@ -169,6 +169,17 @@ def main() -> None:
         nargs="+",
         help="Run only named phases. Final cross-phase report is skipped.",
     )
+    parser.add_argument(
+        "--include-extended",
+        action="store_true",
+        help=(
+            "Also run the plan's `extended_phases`: the reviewer-objection grids "
+            "(robustness, rolling refits, capacity/linear/investable separation, "
+            "severity escalation, client-local standardization, ensemble of "
+            "locals). Far slower than the headline phases and not needed for any "
+            "main table, which is why they are opt-in."
+        ),
+    )
     parser.add_argument("--skip-sanity", action="store_true")
     parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -184,9 +195,16 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
 
     requested = set(args.only or [])
+    # `--only` may name an extended phase without `--include-extended`: naming a
+    # phase explicitly is already the opt-in, and refusing it would only force the
+    # caller to pass both flags for no reason.
+    extended = [dict(phase) for phase in plan.get("extended_phases", [])]
+    available = list(plan["phases"]) + (
+        extended if (args.include_extended or requested) else []
+    )
     phases = [
         phase
-        for phase in plan["phases"]
+        for phase in available
         if not requested or str(phase["name"]) in requested
     ]
     if requested:

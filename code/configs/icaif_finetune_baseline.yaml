@@ -1,0 +1,100 @@
+# Is the per-client cost intrinsic, or an artifact of the single-global-model scope?
+#
+# Why this exists
+# ---------------
+# Three reviewers independently made the same objection. The paper's most
+# quantified economic finding is a PER-CLIENT loss -- under strong covariate shift
+# FedAvg's average participant gives up 0.11 of its own net Sharpe while the
+# aggregated portfolio is unchanged -- and Related Work concedes the tension
+# outright: personalization is exactly the method class designed to reduce that
+# cost, and no method the paper evaluates can. Deferring the entire class to
+# future work while reporting the cost as a headline leaves a reader unable to
+# tell whether the cost is intrinsic to heterogeneity or a consequence of
+# insisting on one global model.
+#
+# This runs the cheapest honest member of that class: take the converged FedAvg
+# model and fine-tune it on each client's own training rows. It needs no new
+# training machinery -- `train_local_models` already starts every client from
+# `model_fn()`, so handing it a factory that returns the global model turns it
+# into per-client fine-tuning, keeping feature masks, logging, and the per-client
+# evaluation path identical to the local baseline.
+#
+# It is deliberately NOT Ditto: no proximal term, no regularization toward the
+# global model, no extra hyperparameter to tune. That makes it a lower bound on
+# what personalization buys, which is the conservative direction for the paper's
+# claim -- if even this recovers the per-client cost, the cost is not intrinsic.
+#
+# Run on the reference protocol AND on strong covariate shift, because the
+# per-client cost is measured under the latter; the reference row is what makes
+# the comparison interpretable.
+#
+# 2 scenarios x 10 seeds = 20 cells.
+#
+# Run:
+#   caffeinate -dims python -u scripts/run_grid.py \
+#       --grid configs/icaif_finetune_baseline.yaml \
+#       --data-path /path/to/qdata/data0712.parquet
+
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/icaif_publication/finetune_baseline
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+
+base_overrides:
+  baselines:
+    centralized: true
+    centralized_masked: false
+    # local: true is required -- the comparison of interest is
+    # fedavg -> fedavg_finetuned -> local, i.e. does personalizing the global
+    # model beat both coordinating and not coordinating.
+    local: true
+    finetune_after_federated:
+      enabled: true
+      algorithms: [fedavg]
+      epochs: 5
+  federated:
+    algorithms: [fedavg]
+    server_lr: 0.003
+
+grid_execution:
+  # 1: expected to share the machine with the rolling grid.
+  parallel_runs: 1
+  max_total_client_workers: 3
+  max_total_torch_threads: 3
+  start_method: spawn
+  parallel_child_console: false
+
+child_logging:
+  console: true
+  round_interval: 10
+
+seeds: [11, 22, 33, 44, 55, 66, 77, 88, 99, 110]
+
+scenarios:
+  # --- reference protocol, investable universe (Table 3's cell) -------------
+  # Universe filter copied verbatim from icaif_core.yaml's ff12_exclude_microcaps.
+  - name: reference_finetune
+    overrides:
+      universe_filter:
+        enabled: true
+        price_col: prc
+        min_abs_price: 5.0
+        market_cap_col: me
+        exclude_bottom_market_cap_fraction: 0.2
+        breakpoint_exchange_col: exchcd
+        breakpoint_exchange_values: [1]
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, server_lr: 0.003}
+
+  # --- strong covariate shift: where the 0.11 per-client cost is measured ---
+  # Copied verbatim from covariate_shift_strong in icaif_heterogeneity.yaml.
+  - name: covariate_shift_strong_finetune
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance: {enabled: false}
+        client_size_matched_control: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: true, location_std: 0.5, log_scale_std: 0.3}
+        covariate_shift_matched_control: {enabled: false}
+      federated: {rounds: 50, participation_rate: 1.0, server_lr: 0.003}

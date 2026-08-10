@@ -1,0 +1,108 @@
+# Does the headline table survive client-local standardization?
+#
+# Why this exists
+# ---------------
+# The benchmark's default preprocessing is a within-month rank-then-z-score over
+# the FULL cross-section, computed at panel construction before clients exist. It
+# is look-ahead-safe, but it is global across clients -- and the paper's premise is
+# that raw data cannot be pooled, so no client in the stated deployment could
+# compute it. A within-month cross-sectional rank requires seeing every client's
+# holdings simultaneously.
+#
+# Three reviewers have now raised this, and the last put it most sharply: the
+# paper is scrupulous about temporal leakage and casual about cross-silo leakage,
+# which is its actual subject.
+#
+# `icaif_client_local_standardization.yaml` already answers the objection for
+# RQ3's dispersion contrast -- the severe feature effect is 5-7% LARGER under
+# client-local preprocessing, so pooled preprocessing was mildly conservative
+# there. But that covers one contrast on three methods. It does not cover
+# Table 3's levels, and it does not cover the RQ2 universe lever. Those are the
+# predictive and economic headline numbers, and they are what a reader would have
+# to discard if global standardization turned out to be load-bearing.
+#
+# This grid supplies them. Every scenario is copied VERBATIM from
+# configs/icaif_core.yaml, and the sole difference anywhere in this file is
+# `data.client_local_standardization: true`. Same 10 seeds as core, so the
+# comparison is within seed set rather than across one.
+#
+# Scenarios, and why these three:
+#   ff12_exclude_microcaps                  -> Table 3's reference cell (50x1)
+#   ff12_exclude_microcaps_more_local_steps -> Table 3's lower block   (10x5)
+#   ff12_full_participation                 -> the unrestricted universe, which
+#                                              RQ2 identifies as the single
+#                                              largest protocol lever
+#
+# 3 scenarios x 10 seeds = 30 cells. Table 5's 408-month refits under
+# client-local preprocessing are a separate and much larger job (34 windows) and
+# are deliberately not attempted here.
+#
+# Run (parallel_runs=1 so this can share a 10-core machine with another grid):
+#   caffeinate -dims python -u scripts/run_grid.py \
+#       --grid configs/icaif_client_local_levels.yaml \
+#       --data-path /path/to/qdata/data0712.parquet
+
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/icaif_publication/client_local_levels
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+
+base_overrides:
+  data:
+    # The only knob that differs from configs/icaif_core.yaml. Applied after
+    # client assignment and before the train/val/test split, so every split sees
+    # the same transform and no future information crosses the split boundary.
+    client_local_standardization: true
+
+grid_execution:
+  # 1, not 2: this grid is expected to run alongside another. Raise it when the
+  # machine is free.
+  parallel_runs: 1
+  max_total_client_workers: 3
+  max_total_torch_threads: 3
+  start_method: spawn
+  parallel_child_console: false
+
+child_logging:
+  console: true
+  round_interval: 5
+  epoch_interval: 5
+
+# Identical to configs/icaif_core.yaml's seed list. This is required, not
+# incidental: comparing client-local against global across different seed sets
+# would confound preprocessing with seed draw.
+seeds: [11, 22, 33, 44, 55, 66, 77, 88, 99, 110]
+
+scenarios:
+  # --- Table 3, reference cell (50 rounds x 1 local epoch) -------------------
+  # Universe filter copied verbatim from icaif_core.yaml's ff12_exclude_microcaps.
+  - name: ff12_exclude_microcaps
+    overrides:
+      universe_filter:
+        enabled: true
+        price_col: prc
+        min_abs_price: 5.0
+        market_cap_col: me
+        exclude_bottom_market_cap_fraction: 0.2
+        breakpoint_exchange_col: exchcd
+        breakpoint_exchange_values: [1]
+      federated: {server_lr: 0.003}
+
+  # --- Table 3, lower block (10 rounds x 5 local epochs) --------------------
+  - name: ff12_exclude_microcaps_more_local_steps
+    overrides:
+      universe_filter:
+        enabled: true
+        price_col: prc
+        min_abs_price: 5.0
+        market_cap_col: me
+        exclude_bottom_market_cap_fraction: 0.2
+        breakpoint_exchange_col: exchcd
+        breakpoint_exchange_values: [1]
+      federated: {rounds: 10, participation_rate: 1.0, local_epochs: 5, server_lr: 0.003}
+
+  # --- RQ2's largest lever: the unrestricted universe -----------------------
+  - name: ff12_full_participation
+    overrides:
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, server_lr: 0.003}

@@ -1,0 +1,180 @@
+# Pricing privacy: client-level DP across the noise scale.
+#
+# A reviewer's standing objection is that privacy is the reason one federates and
+# this benchmark prices none of it, and that "aggregation choice buys little" is
+# the claim most likely to invert under noise -- FedAvg, SCAFFOLD and FedAdam do
+# not absorb a noisy update identically.
+#
+# A single epsilon would have been the wrong experiment. The clip norm is
+# calibrated to the measured update-norm distribution (median 0.0046 across
+# rounds on the reference cell, so C = 0.005; a probe with C = 1.0 clipped
+# nothing and would have reported noise as a finding). At that C, with K = 12
+# clients and 2,625 parameters, the noise added to the mean scales as roughly
+# 4.3 * sigma times the update itself -- so the interesting range is sigma < 1,
+# far below textbook values, and a single point would have landed either in the
+# no-privacy or the no-utility regime by luck.
+#
+# The sweep therefore spans the transition and reports both sigma and its
+# accounted epsilon, so the paper can state where the comparison survives and
+# where it collapses rather than asserting either.
+#
+#   sigma  epsilon (T=50, delta=1e-5)   noise/signal
+#   0.00   inf  (clipping only)         0.0
+#   0.10   2836                         0.4
+#   0.25   533                          1.1
+#   0.50   166                          2.1
+#   1.00   57                           4.3
+#   4.00   9.2                          17.2
+#
+# sigma = 0 is the load-bearing control: it isolates the cost of clipping and
+# uniform averaging (both required by the mechanism) from the cost of the noise.
+# Without it, any utility loss could be blamed on either.
+#
+# Run:
+#   caffeinate -dims python -u scripts/run_grid.py --grid configs/icaif_dp_sweep.yaml \
+#     --data-path /path/to/data0712.parquet
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/icaif_publication/dp_sweep
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+base_overrides:
+  baselines:
+    centralized: true
+    centralized_masked: false
+    local: false
+  federated:
+    algorithms:
+    - fedavg
+    - scaffold
+    - fedadam
+    server_lr: 0.003
+grid_execution:
+  parallel_runs: 3
+  max_total_client_workers: 9
+  max_total_torch_threads: 9
+  start_method: spawn
+  parallel_child_console: false
+child_logging:
+  console: true
+  round_interval: 10
+seeds:
+- 11
+- 22
+- 33
+- 44
+- 55
+- 66
+- 77
+- 88
+- 99
+- 110
+scenarios:
+- name: dp_clip_only
+  overrides:
+    universe_filter:
+      enabled: true
+      price_col: prc
+      min_abs_price: 5.0
+      market_cap_col: me
+      exclude_bottom_market_cap_fraction: 0.2
+      breakpoint_exchange_col: exchcd
+      breakpoint_exchange_values:
+      - 1
+    federated:
+      server_lr: 0.003
+      dp:
+        enabled: true
+        clip_norm: 0.005
+        noise_multiplier: 0.0
+        delta: 1.0e-05
+- name: dp_sigma_0p10
+  overrides:
+    universe_filter:
+      enabled: true
+      price_col: prc
+      min_abs_price: 5.0
+      market_cap_col: me
+      exclude_bottom_market_cap_fraction: 0.2
+      breakpoint_exchange_col: exchcd
+      breakpoint_exchange_values:
+      - 1
+    federated:
+      server_lr: 0.003
+      dp:
+        enabled: true
+        clip_norm: 0.005
+        noise_multiplier: 0.1
+        delta: 1.0e-05
+- name: dp_sigma_0p25
+  overrides:
+    universe_filter:
+      enabled: true
+      price_col: prc
+      min_abs_price: 5.0
+      market_cap_col: me
+      exclude_bottom_market_cap_fraction: 0.2
+      breakpoint_exchange_col: exchcd
+      breakpoint_exchange_values:
+      - 1
+    federated:
+      server_lr: 0.003
+      dp:
+        enabled: true
+        clip_norm: 0.005
+        noise_multiplier: 0.25
+        delta: 1.0e-05
+- name: dp_sigma_0p50
+  overrides:
+    universe_filter:
+      enabled: true
+      price_col: prc
+      min_abs_price: 5.0
+      market_cap_col: me
+      exclude_bottom_market_cap_fraction: 0.2
+      breakpoint_exchange_col: exchcd
+      breakpoint_exchange_values:
+      - 1
+    federated:
+      server_lr: 0.003
+      dp:
+        enabled: true
+        clip_norm: 0.005
+        noise_multiplier: 0.5
+        delta: 1.0e-05
+- name: dp_sigma_1p00
+  overrides:
+    universe_filter:
+      enabled: true
+      price_col: prc
+      min_abs_price: 5.0
+      market_cap_col: me
+      exclude_bottom_market_cap_fraction: 0.2
+      breakpoint_exchange_col: exchcd
+      breakpoint_exchange_values:
+      - 1
+    federated:
+      server_lr: 0.003
+      dp:
+        enabled: true
+        clip_norm: 0.005
+        noise_multiplier: 1.0
+        delta: 1.0e-05
+- name: dp_sigma_4p00
+  overrides:
+    universe_filter:
+      enabled: true
+      price_col: prc
+      min_abs_price: 5.0
+      market_cap_col: me
+      exclude_bottom_market_cap_fraction: 0.2
+      breakpoint_exchange_col: exchcd
+      breakpoint_exchange_values:
+      - 1
+    federated:
+      server_lr: 0.003
+      dp:
+        enabled: true
+        clip_norm: 0.005
+        noise_multiplier: 4.0
+        delta: 1.0e-05

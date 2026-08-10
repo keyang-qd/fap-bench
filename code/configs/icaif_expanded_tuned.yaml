@@ -1,0 +1,87 @@
+# The method comparison at a configuration that actually predicts.
+#
+# Why this grid exists
+# --------------------
+# Five review rounds raised what looked like five objections -- "close to a
+# measurement of noise", "architecture-conditional", "seven characteristics
+# against the 94-characteristic norm", "headline confounded with capacity",
+# "ridge's coordination cost is zero by construction" -- and they are one
+# objection: the benchmark measures coordination cost in a configuration with no
+# signal to coordinate over, and the only configuration with signal (linear/ridge)
+# is one where coordination cost is zero by construction.
+#
+# This grid is the answer. It runs the FULL method set at the wide panel and the
+# architecture the validation sweep selected for it, on the reference investable
+# universe and the reference budget, so the only thing that changes against
+# Table 3 is the panel/capacity pair.
+#
+#   panel        : 20 characteristics (crsp_compustat_profitability_expanded)
+#   architecture : [128, 64], client_lr 0.01
+#                  -- selected in configs/icaif_expanded_capacity_sweep.yaml on
+#                     VALIDATION Rank IC alone (expanded_capacity_selection.json,
+#                     selected_scenario=expanded_capacity_h128_64_lr0_01). Copied
+#                     here rather than re-selected, so this grid inherits a
+#                     selection that never saw test data.
+#   universe     : investable (ff12_exclude_microcaps, verbatim)
+#   budget       : 50 rounds x 1 local epoch, full participation
+#   seeds        : 10, matching the core cell it is compared against
+#
+# The capacity sweep ran only centralized + fedavg because it was selecting an
+# architecture, not comparing methods. That is exactly why it cannot answer the
+# objection: it has no scaffold, no fedadam, no local. This grid adds them.
+#
+# Run:
+#   caffeinate -dims python -u scripts/run_grid.py \
+#     --grid configs/icaif_expanded_tuned.yaml --data-path /path/to/panel.parquet
+base_config: crsp_compustat_profitability_expanded.yaml
+output_dir: outputs/icaif_publication/expanded_tuned
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+
+base_overrides:
+  baselines:
+    centralized: true
+    centralized_masked: false
+    # Local IS kept. It is the most expensive arm in a cell, but Local-vs-
+    # Centralized is the widest gap in the headline table, so dropping it would
+    # remove the comparison most likely to move once the model has signal.
+    local: true
+  federated:
+    algorithms: [fedavg, scaffold, fedadam]
+    server_lr: 0.003
+
+grid_execution:
+  parallel_runs: 3
+  max_total_client_workers: 9
+  max_total_torch_threads: 9
+  start_method: spawn
+  parallel_child_console: false
+
+child_logging:
+  console: true
+  round_interval: 10
+
+# Ten, matching REFERENCE_SCENARIO in the core grid. A reviewer would otherwise
+# be comparing a 10-seed cell against a 3-seed one and reading the difference in
+# replication as a difference in method.
+seeds: [11, 22, 33, 44, 55, 66, 77, 88, 99, 110]
+
+scenarios:
+  - name: ff12_exclude_microcaps_tuned20
+    overrides:
+      universe_filter:
+        enabled: true
+        price_col: prc
+        min_abs_price: 5.0
+        market_cap_col: me
+        exclude_bottom_market_cap_fraction: 0.2
+        breakpoint_exchange_col: exchcd
+        breakpoint_exchange_values: [1]
+      model: {hidden_dims: [128, 64]}
+      federated:
+        rounds: 50
+        participation_rate: 1.0
+        local_epochs: 1
+        client_lr: 0.01
+        server_lr: 0.003

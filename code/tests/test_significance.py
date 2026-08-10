@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 import pandas as pd
 
 from fapbench.evaluation.significance import (
@@ -380,3 +381,107 @@ def test_seed_averaged_contrasts_accepts_a_subperiod_mask(tmp_path):
     assert int(partial.iloc[0]["n_months"]) == 24
     assert full.iloc[0]["period"] == "full"
     assert partial.iloc[0]["period"] == "ex-2020"
+
+
+# --- expanding-window RQ3 dispersion contrasts -----------------------------
+#
+# The reviewer objection these cover: the paper builds a 408-month expanding
+# window for its economic axis but leaves RQ3 at n=60. The estimator that
+# closes that gap must (a) actually pool months across windows rather than
+# averaging per-window effects, and (b) refuse to pool overlapping windows,
+# which would double-count months and deflate the HAC standard error.
+
+
+def _write_window_pair(root: Path, arm: str, year: int, rhos: dict[str, float],
+                       *, periods: int = 24, seeds=(11, 22, 33)) -> None:
+    dates = pd.date_range(f"{year}-01-31", periods=periods, freq="ME")
+    for seed in seeds:
+        _write_predictions(
+            root / f"{arm}__refit_{year}" / f"seed_{seed}",
+            method="fedavg", dates=dates, client_rhos=rhos, seed=seed + year,
+        )
+
+
+def test_rolling_dispersion_contrasts_pools_months_across_windows(tmp_path: Path):
+    """Three disjoint 24-month windows must yield one 72-month series, not
+    three separate contrasts and not a 24-month average of them."""
+    from fapbench.evaluation.significance import rolling_dispersion_contrasts
+
+    spread = {"client_00": 0.7, "client_01": 0.7, "client_02": -0.1, "client_03": -0.1}
+    flat = {f"client_0{i}": 0.3 for i in range(4)}
+    years = [1990, 1992, 1994]
+    for year in years:
+        _write_window_pair(tmp_path, "treated", year, spread)
+        _write_window_pair(tmp_path, "control", year, flat)
+
+    result = rolling_dispersion_contrasts(
+        {
+            "treated minus control": [
+                (tmp_path / f"treated__refit_{y}", tmp_path / f"control__refit_{y}")
+                for y in years
+            ]
+        },
+        methods=["fedavg"], n_bootstrap=500,
+    )
+    row = result.iloc[0]
+    assert int(row["n_windows"]) == 3
+    assert int(row["n_months"]) == 72  # 3 x 24, pooled -- not 24
+    assert int(row["n_seeds"]) == 3
+    assert row["effect"] > 0
+    assert row["statistic"] == "std"
+
+
+def test_rolling_dispersion_contrasts_rejects_overlapping_windows(tmp_path: Path):
+    """Overlapping test blocks would count a month twice. That must fail loudly:
+    it deflates the HAC standard error, so it manufactures significance."""
+    from fapbench.evaluation.significance import rolling_dispersion_contrasts
+
+    spread = {"client_00": 0.7, "client_01": 0.7, "client_02": -0.1, "client_03": -0.1}
+    flat = {f"client_0{i}": 0.3 for i in range(4)}
+    # Both windows start in 1990 and run 24 months -> identical month index.
+    for arm, rhos in [("treated", spread), ("control", flat)]:
+        _write_window_pair(tmp_path, arm, 1990, rhos)
+        _write_window_pair(tmp_path, arm, 1991, rhos)
+    # Force the overlap: rewrite 1991's block over the same dates as 1990's.
+    for arm, rhos in [("treated", spread), ("control", flat)]:
+        for seed in (11, 22, 33):
+            _write_predictions(
+                tmp_path / f"{arm}__refit_1991" / f"seed_{seed}", method="fedavg",
+                dates=pd.date_range("1990-01-31", periods=24, freq="ME"),
+                client_rhos=rhos, seed=seed + 1991,
+            )
+
+    with pytest.raises(ValueError, match="overlap"):
+        rolling_dispersion_contrasts(
+            {
+                "treated minus control": [
+                    (tmp_path / f"treated__refit_{y}", tmp_path / f"control__refit_{y}")
+                    for y in (1990, 1991)
+                ]
+            },
+            methods=["fedavg"], n_bootstrap=100,
+        )
+
+
+def test_rolling_and_single_window_agree_on_a_single_window(tmp_path: Path):
+    """With one window the two estimators must return the same effect: they
+    share the difference-matrix helper, and this pins that they still do."""
+    from fapbench.evaluation.significance import (
+        rolling_dispersion_contrasts,
+        seed_averaged_dispersion_contrasts,
+    )
+
+    spread = {"client_00": 0.7, "client_01": 0.7, "client_02": -0.1, "client_03": -0.1}
+    flat = {f"client_0{i}": 0.3 for i in range(4)}
+    _write_window_pair(tmp_path, "treated", 1990, spread)
+    _write_window_pair(tmp_path, "control", 1990, flat)
+    t, c = tmp_path / "treated__refit_1990", tmp_path / "control__refit_1990"
+
+    rolled = rolling_dispersion_contrasts(
+        {"lab": [(t, c)]}, methods=["fedavg"], n_bootstrap=500,
+    )
+    single = seed_averaged_dispersion_contrasts(
+        [(t, c, "lab")], methods=["fedavg"], statistics=("std",), n_bootstrap=500,
+    )
+    assert rolled.iloc[0]["effect"] == pytest.approx(single.iloc[0]["effect"])
+    assert rolled.iloc[0]["n_months"] == single.iloc[0]["n_months"]

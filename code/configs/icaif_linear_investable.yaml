@@ -1,0 +1,93 @@
+# Does the linear/ridge model reach positive net Sharpe on the INVESTABLE universe?
+#
+# Why this exists
+# ---------------
+# The manuscript states an explicit target: a net Sharpe distinguishable from
+# Centralized's, on the investable universe, at matched communication -- and
+# reports that no method meets it. But the model class RQ2 calls "the sharpest
+# lever of all" was only ever run on the *unrestricted* universe, where it raises
+# FedAvg's Rank IC from 0.0344 to 0.0756 and turns worst-client Rank IC positive.
+#
+# So the central negative claim has never been tested against the paper's own
+# strongest model. A reviewer identified this as the single missing experiment
+# separating borderline from clear accept, and the logic is sound in both
+# directions:
+#
+#   - if linear/ridge reaches positive net Sharpe here, the headline claim
+#     ("no method earns its keep") is FALSE and must be rewritten;
+#   - if it does not, the claim becomes far stronger, because it then holds
+#     against the best model the benchmark contains rather than against one
+#     architecture the paper itself shows is dominated.
+#
+# Either way the manuscript changes. That is the point of running it.
+#
+# Design
+# ------
+# The linear_ridge_weak scenario from configs/icaif_robustness.yaml, verbatim,
+# with the investable universe filter from ff12_exclude_microcaps in
+# configs/icaif_core.yaml -- also verbatim. The universe is the only difference
+# from the published linear/ridge arm, and the model is the only difference from
+# the reference protocol, so the new cell is comparable to both.
+#
+# The strong-penalty variant is included because the published result reports
+# weak and strong ridge penalties agreeing; keeping both lets that agreement be
+# rechecked on the reference universe rather than assumed to carry over.
+#
+# All seven methods are trained: Centralized is the comparator the target is
+# defined against, and Local bounds the no-collaboration floor.
+#
+# 2 scenarios x 10 seeds = 20 cells.
+#
+# Run:
+#   caffeinate -dims python -u scripts/run_grid.py \
+#     --grid configs/icaif_linear_investable.yaml \
+#     --data-path /path/to/qdata/data0712.parquet
+
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/icaif_publication/linear_investable
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+
+base_overrides:
+  # Investable universe, verbatim from ff12_exclude_microcaps.
+  universe_filter:
+    enabled: true
+    price_col: prc
+    min_abs_price: 5.0
+    market_cap_col: me
+    exclude_bottom_market_cap_fraction: 0.2
+    breakpoint_exchange_col: exchcd
+    breakpoint_exchange_values: [1]
+  baselines:
+    centralized: true
+    centralized_masked: false
+    local: true
+  federated:
+    algorithms: [fedavg, fedprox, scaffold, fedadam]
+
+grid_execution:
+  parallel_runs: 2
+  max_total_client_workers: 6
+  max_total_torch_threads: 6
+  start_method: spawn
+  parallel_child_console: false
+
+child_logging:
+  console: true
+  round_interval: 10
+
+seeds: [11, 22, 33, 44, 55, 66, 77, 88, 99, 110]
+
+scenarios:
+  # Both blocks verbatim from icaif_robustness.yaml; only the universe differs.
+  - name: linear_ridge_weak
+    overrides:
+      model: {hidden_dims: [], dropout: 0.0, batch_norm: false}
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1,
+                  server_lr: 0.003, weight_decay: 0.0001}
+  - name: linear_ridge_strong
+    overrides:
+      model: {hidden_dims: [], dropout: 0.0, batch_norm: false}
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1,
+                  server_lr: 0.003, weight_decay: 0.01}

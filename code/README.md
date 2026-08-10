@@ -104,6 +104,29 @@ python -u scripts/run_publication_experiments.py \
 
 A partial run does not rebuild the cross-phase paper report. Running the full command afterward reuses completed matching cells and finishes aggregation.
 
+### Run the reviewer-objection grids too
+
+The seven phases in `configs/icaif_publication.yaml`'s `phases` produce every
+headline table. Nine further grids -- listed in the same file under
+`extended_phases`, and each answering one specific objection (robustness levers,
+expanding-window refits, capacity/linear/investable separation, severity
+escalation, client-local standardization, ensemble of locals) -- are opt-in
+because together they take an order of magnitude longer than the headline
+phases:
+
+```bash
+python -u scripts/run_publication_experiments.py \
+  --data-path /path/to/qdata/data0712.parquet \
+  --include-extended
+```
+
+Their publication tables are written empty until the corresponding grid exists,
+so the headline run never fails for want of them. `--only <name>` runs a single
+extended grid without the flag. `configs/icaif_publication.yaml` is the complete
+manifest of grids the manuscript draws on -- a test asserts every shipped
+`configs/icaif_*.yaml` appears in exactly one of the two lists, so a new grid
+cannot be added without registering it.
+
 ## Publication outputs
 
 The complete command writes to `outputs/icaif_publication/`:
@@ -328,6 +351,55 @@ grid does for three pairs (two data-level, one system-level) at `[256, 128]` (~3
 reuses `seed_averaged_dispersion_contrasts` unchanged, so the effects are directly comparable to the
 reference-capacity ones in `matched_control_dispersion_monthly`. Like the other separately-run grids,
 the table is written empty until the grid exists.
+
+Three further tables answer the same "is the separation real?" question at other settings, all fed by
+separately-run grids and all built from the same `_phase_dispersion_contrasts` helper so their effects
+stay comparable with `matched_control_dispersion_monthly` cell for cell:
+
+| table | grid | question |
+| --- | --- | --- |
+| `rq3_investable` | `configs/icaif_rq3_investable.yaml` | does the separation survive the *reference* universe? The heterogeneity grid ran unrestricted, so RQ3's headline was measured on a universe the paper does not use as its reference. |
+| `linear_separation` | `configs/icaif_linear_separation.yaml` | does it survive the model class RQ2 identifies as the sharpest lever? |
+| `severity_escalation` | `configs/icaif_severity_escalation.yaml` | the two heterogeneity families are dialled in incommensurable units, so nothing establishes that "severe" masking and a 40% outage block sit at comparable severities. Rather than assert calibration, escalate: outages 40% -> 60% -> 80%, imbalance r=20 -> 50 -> 100, each rung with its own matched control, and report where the system-level effects land. |
+
+These are named without the `robustness_` prefix because the manuscript cites them as RQ3 results
+rather than appendix material, and `scripts/audit_manuscript_numbers.py` in the paper repository binds
+these exact filenames.
+
+### Ensemble of local models
+
+`baselines.ensemble_local` (default **off**) adds an `ensemble_local` method row.
+Federation is not the only way to use K clients' data without pooling it: the cheap
+alternative is to train locally, ship the K finished models once, and average their
+opinions -- no rounds, no coordination, no shared optimizer state. If that matched
+federated training, the benchmark's central comparison would be far less
+interesting, so it is measured rather than argued away.
+
+Two implementation choices matter and are pinned by `tests/test_ensemble_local.py`:
+
+- **Ranks are averaged, not scores.** Independently trained local models are not
+  calibrated against each other -- the same reason the local-only *portfolio* score
+  is a within-client percentile rank. Averaging raw scores would let one member's
+  scale decide the ensemble; averaging within-month cross-sectional percentile ranks
+  makes the result invariant to any monotone rescaling of an individual member.
+- **Each member scores under its own feature mask.** A client that never saw a
+  characteristic does not get it back at inference, so an ensemble member is the
+  model as it was actually trained.
+
+Because rank-averaging discards level information, the ensemble's prediction is a
+percentile rather than a return, so every squared-error metric (`mse`, `mae`,
+`oos_r2_*`, and their per-client variants) is written as `NaN` for this row and
+`prediction_scale` records why -- an OOS \(R^2\) of -20 against realized returns is a
+category error, not a poor result. Rank IC, the portfolio metrics, and the
+client-level metrics are all well defined and are reported normally.
+
+The baseline requires `baselines.local`, and asks for it explicitly: the ensemble
+aggregates the local baseline's own per-client models, so the two rows decompose one
+training run into training and aggregation. A config requesting the ensemble without
+the local baseline raises rather than silently skipping. `configs/icaif_ensemble_local.yaml`
+runs it on both the reference and unrestricted universes at the same 10 seeds as
+`icaif_core.yaml`, with every other method trained in the same run so the contrasts
+are exactly paired.
 
 ### Client-local standardization
 

@@ -1,0 +1,128 @@
+# RQ2's matched-control separation, re-measured at the wide panel.
+#
+# What this tests, precisely
+# --------------------------
+# The paper's one crisply resolved heterogeneity result is that data-level
+# treatments (feature availability, covariate shift) disperse per-client accuracy
+# an order of magnitude more than system-level ones (timing, size), each against
+# its own matched control. That has already been checked at two other model
+# classes -- 35k parameters (robustness_capacity_separation) and linear/ridge
+# (linear_separation) -- and survives both. The one class it has never been
+# measured at is the WIDE PANEL, which is also the configuration where the
+# coordination cost finally resolved.
+#
+# One thing changes against configs/icaif_heterogeneity.yaml and
+# configs/icaif_identification.yaml: the panel/capacity pair. The universe stays
+# unrestricted, the treatments and their matched controls are copied verbatim,
+# and the budget is unchanged. A reader comparing this grid to those two is
+# therefore comparing model class, not four things at once.
+#
+# Note on the premise: RQ2 was NOT computed in the underpowered reference cell.
+# It runs unrestricted, where Centralized's Rank IC is 0.0452 against the
+# investable reference's 0.0111 -- roughly 4x the signal. This grid closes a
+# genuine gap in the robustness ladder, not a hole in the result.
+#
+# Scope: the three pairs that carry the claim -- the largest data-level contrast
+# (feature severe), the other data-level channel (covariate strong), and the
+# largest system-level contrast (block outages). The intermediate severities are
+# not re-run: they establish the dose-response, which the ordering claim does not
+# depend on.
+#
+# Seeds: 10, not the 20 used by the source grids. The matched-control test pairs
+# WITHIN seed, so 10 still gives 10 paired comparisons per contrast; this is a
+# robustness replication, and the 20-seed grids remain the reported result.
+#
+# Run:
+#   caffeinate -dims python -u scripts/run_grid.py --grid configs/icaif_rq2_tuned20.yaml \
+#     --data-path /path/to/data0712_expanded.parquet
+base_config: crsp_compustat_profitability_expanded.yaml
+output_dir: outputs/icaif_publication/rq2_tuned20
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+
+base_overrides:
+  baselines:
+    centralized: true
+    # Kept: the oracle-minus-masked gap is what separates information removal
+    # from coordination loss, and that decomposition is quoted in Section 4.4.
+    centralized_masked: true
+    local: false
+  federated:
+    algorithms: [fedavg, scaffold, fedadam]
+    server_lr: 0.003
+  model:
+    hidden_dims: [128, 64]
+
+grid_execution:
+  parallel_runs: 3
+  max_total_client_workers: 9
+  max_total_torch_threads: 9
+  start_method: spawn
+  parallel_child_console: false
+
+child_logging:
+  console: true
+  round_interval: 10
+
+seeds: [11, 22, 33, 44, 55, 66, 77, 88, 99, 110]
+
+scenarios:
+  # --- data-level: feature availability (largest contrast in the paper) ---
+  - name: feature_heterogeneity_severe
+    overrides:
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.01}
+      feature_heterogeneity:
+        {enabled: true, common_fraction: 0.15, private_fraction: 0.35,
+         shared_private_selection: false}
+  - name: feature_heterogeneity_severe_matched
+    overrides:
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.01}
+      feature_heterogeneity:
+        {enabled: true, common_fraction: 0.15, private_fraction: 0.35,
+         shared_private_selection: true}
+
+  # --- data-level: covariate shift (the other channel) ---
+  - name: covariate_shift_strong
+    overrides:
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.01}
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance: {enabled: false}
+        client_size_matched_control: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: true, location_std: 0.5, log_scale_std: 0.3}
+        covariate_shift_matched_control: {enabled: false}
+  - name: covariate_shift_strong_matched
+    overrides:
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.01}
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance: {enabled: false}
+        client_size_matched_control: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: false}
+        covariate_shift_matched_control:
+          {enabled: true, location_std: 0.5, log_scale_std: 0.3}
+
+  # --- system-level: block outages (largest system-level contrast) ---
+  # Copied from configs/icaif_identification.yaml. That grid disables the
+  # centralized baselines because a temporal treatment acts only through the
+  # federated schedule and a pooled model is unaffected by it; they are left
+  # enabled here so every scenario in this grid reports the same method set, at
+  # the cost of two redundant baseline fits per cell.
+  - name: temporal_block_outages_identified
+    overrides:
+      federated:
+        {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.01,
+         server_lr: 0.003}
+      temporal_heterogeneity: {enabled: true, mode: block, block_fraction: 0.4}
+  - name: temporal_random_matched_block_outages
+    overrides:
+      federated:
+        {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.01,
+         server_lr: 0.003}
+      temporal_heterogeneity:
+        enabled: true
+        mode: matched_random
+        matched_reference: {mode: block, block_fraction: 0.4}

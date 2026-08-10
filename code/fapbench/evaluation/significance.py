@@ -17,7 +17,7 @@ test across truly independent samples.
 """
 
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -377,6 +377,110 @@ def _monthly_client_dispersion_series(
     return std_series, worst_series
 
 
+def matched_control_placebo(
+    controls: Sequence[tuple[Path, str]],
+    *,
+    methods: Sequence[str] | None = None,
+    statistics: Sequence[str] = ("std",),
+    hac_lag: int | None = None,
+) -> pd.DataFrame:
+    """Control-versus-control placebo on the dispersion estimator.
+
+    A reviewer raised the one alternative explanation the manuscript's existing
+    checks do not rule out. Per-client monthly Rank IC is near zero with large
+    sampling noise, so cross-client *dispersion* could move with effective
+    per-client sample size and feature configuration without any economically
+    meaningful degradation -- in which case a nonzero treatment-minus-control
+    difference would be an artifact of the statistic rather than evidence of
+    structure.
+
+    The placebo settles it without new training. Instead of differencing a
+    treatment against its matched control, this differences the control arm
+    against *itself*: seeds are split into disjoint pairs and one member of each
+    pair is differenced against the other, through the identical estimator,
+    lag rule, and Stouffer combination the real contrast uses. Both sides are
+    then draws from the same distribution, so the true effect is exactly zero
+    and anything the estimator reports is its own noise floor.
+
+    Seeds are paired in sorted order rather than at random: the pairing has to be
+    reproducible from the artifact, and a random pairing would make the reported
+    placebo depend on an unrecorded draw.
+    """
+    cache: dict[tuple[str, str], tuple[pd.Series, pd.Series]] = {}
+
+    def _series(seed_dir: Path, method: str) -> tuple[pd.Series, pd.Series]:
+        key = (str(seed_dir), method)
+        if key not in cache:
+            cache[key] = _monthly_client_dispersion_series(seed_dir, method)
+        return cache[key]
+
+    rows: list[dict[str, Any]] = []
+    for control_dir, label in controls:
+        control_dir = Path(control_dir)
+        if not control_dir.exists():
+            continue
+        seeds = {_seed_id(p): p for p in _seed_dirs(control_dir)}
+        ordered = sorted(seeds, key=str)
+        # Disjoint pairs: (0,1), (2,3), ... A seed is never differenced against
+        # itself, which would give an identically zero series and a degenerate
+        # test rather than a placebo.
+        seed_pairs = [
+            (ordered[i], ordered[i + 1]) for i in range(0, len(ordered) - 1, 2)
+        ]
+        if not seed_pairs:
+            continue
+        resolved_methods = list(methods) if methods is not None else None
+        if resolved_methods is None:
+            benchmark_path = seeds[ordered[0]] / "benchmark_results.csv"
+            if benchmark_path.exists():
+                resolved_methods = (
+                    pd.read_csv(benchmark_path)["method"].astype(str).unique().tolist()
+                )
+            else:
+                resolved_methods = []
+        for method in resolved_methods:
+            for statistic in statistics:
+                stat_index = 0 if statistic == "std" else 1
+                per_pair_rows: list[dict[str, Any]] = []
+                for left, right in seed_pairs:
+                    left_series = _series(seeds[left], method)[stat_index]
+                    right_series = _series(seeds[right], method)[stat_index]
+                    aligned = pd.concat(
+                        [left_series, right_series], axis=1, join="inner"
+                    ).dropna()
+                    if aligned.empty:
+                        continue
+                    difference = aligned.iloc[:, 0] - aligned.iloc[:, 1]
+                    test = newey_west_mean_test(difference, max_lag=hac_lag)
+                    per_pair_rows.append({"pair": f"{left}|{right}", **test})
+                if not per_pair_rows:
+                    continue
+                frame = pd.DataFrame(per_pair_rows)
+                combined = stouffer_combine(
+                    frame["t_statistic"], frame["p_value"]
+                )
+                rows.append(
+                    {
+                        "contrast": label,
+                        "method": method,
+                        "statistic": statistic,
+                        "n_pairs": int(len(frame)),
+                        "mean_t_statistic": float(frame["t_statistic"].mean()),
+                        "mean_difference_of_means": float(
+                            frame["mean_difference"].mean()
+                        ),
+                        "max_abs_difference_of_means": float(
+                            frame["mean_difference"].abs().max()
+                        ),
+                        "fraction_pairs_significant_at_5pct": float(
+                            (frame["p_value"] < 0.05).mean()
+                        ),
+                        **combined,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
 def heterogeneity_dispersion_hac_contrasts(
     pairs: Sequence[tuple[Path, Path, str]],
     *,
@@ -469,6 +573,154 @@ def heterogeneity_dispersion_hac_contrasts(
     return pd.DataFrame(rows)
 
 
+def _pair_seed_difference_matrix(
+    treatment_dir: Path,
+    control_dir: Path,
+    method: str,
+    stat_index: int,
+    series_fn: Callable[[Path, str], tuple[pd.Series, pd.Series]],
+) -> pd.DataFrame | None:
+    """Treatment-minus-control monthly differences for one scenario pair.
+
+    Returns a months x seeds frame, or None when the pair contributes nothing.
+    Shared verbatim by the single-window and expanding-window estimators so the
+    two can never silently diverge in how a difference series is built.
+    """
+    treatment_dir = Path(treatment_dir)
+    control_dir = Path(control_dir)
+    if not treatment_dir.exists() or not control_dir.exists():
+        return None
+    treatment_seeds = {_seed_id(p): p for p in _seed_dirs(treatment_dir)}
+    control_seeds = {_seed_id(p): p for p in _seed_dirs(control_dir)}
+    common_seeds = sorted(set(treatment_seeds) & set(control_seeds), key=str)
+    if not common_seeds:
+        return None
+    per_seed: list[pd.Series] = []
+    for seed_id in common_seeds:
+        treatment = series_fn(treatment_seeds[seed_id], method)[stat_index]
+        control = series_fn(control_seeds[seed_id], method)[stat_index]
+        aligned = pd.concat([treatment, control], axis=1, join="inner").dropna()
+        if aligned.empty:
+            continue
+        per_seed.append((aligned.iloc[:, 0] - aligned.iloc[:, 1]).rename(str(seed_id)))
+    if not per_seed:
+        return None
+    return pd.concat(per_seed, axis=1)
+
+
+def rolling_dispersion_contrasts(
+    labelled_windows: Mapping[str, Sequence[tuple[Path, Path]]],
+    *,
+    methods: Sequence[str] | None = None,
+    statistics: Sequence[str] = ("std",),
+    hac_lag: int | None = None,
+    block_length: int = 6,
+    n_bootstrap: int = 5000,
+    bootstrap_seed: int = 42,
+    period_label: str = "full",
+) -> pd.DataFrame:
+    """Matched-control dispersion contrasts over expanding-window refits.
+
+    ``seed_averaged_dispersion_contrasts`` tests one contrast on one training
+    window, so its series is as long as that window's test block -- 60 months at
+    the reference protocol. A reviewer's sharpest methodological point was that
+    the paper already builds a 408-month expanding-window sample for its economic
+    axis but leaves RQ3, whose claims are the sharpest in the paper, at n=60.
+
+    This estimator closes that gap. Each refit window contributes its own
+    treatment-minus-control monthly difference matrix, computed by exactly the
+    same helper the single-window estimator uses; the matrices are then
+    concatenated along the time axis into one long series before the
+    Newey-West test and the moving-block bootstrap run.
+
+    Concatenation is legitimate here for the same reason it is in
+    ``fapbench.rolling``: dispersion is computed within a month across clients,
+    and windows contribute disjoint test months, so adjacent windows join
+    without overlap or double-counting. The seed-averaging step is unchanged --
+    seeds remain repeated measurements, not independent draws.
+
+    ``labelled_windows`` maps a contrast label to that contrast's per-window
+    ``(treatment_dir, control_dir)`` pairs.
+    """
+    cache: dict[tuple[str, str], tuple[pd.Series, pd.Series]] = {}
+
+    def _series(seed_dir: Path, method: str) -> tuple[pd.Series, pd.Series]:
+        key = (str(seed_dir), method)
+        if key not in cache:
+            cache[key] = _monthly_client_dispersion_series(seed_dir, method)
+        return cache[key]
+
+    rows: list[dict[str, Any]] = []
+    for label, window_pairs in labelled_windows.items():
+        resolved_methods = list(methods) if methods is not None else []
+        for method in resolved_methods:
+            for statistic in statistics:
+                stat_index = 0 if statistic == "std" else 1
+                matrices = [
+                    m
+                    for treatment_dir, control_dir in window_pairs
+                    if (
+                        m := _pair_seed_difference_matrix(
+                            treatment_dir, control_dir, method, stat_index, _series
+                        )
+                    )
+                    is not None
+                ]
+                if not matrices:
+                    continue
+                matrix = pd.concat(matrices, axis=0).sort_index()
+                # Windows must not overlap: a repeated month would be counted
+                # twice and would deflate the HAC standard error.
+                if matrix.index.duplicated().any():
+                    raise ValueError(
+                        f"[{label}/{method}/{statistic}] expanding windows overlap: "
+                        f"{int(matrix.index.duplicated().sum())} duplicated months. "
+                        "Refit windows must contribute disjoint test months."
+                    )
+                averaged = matrix.mean(axis=1).dropna()
+                if len(averaged) < 3:
+                    continue
+                test = newey_west_mean_test(averaged, max_lag=hac_lag)
+                interval = moving_block_bootstrap_mean(
+                    averaged,
+                    block_length=block_length,
+                    n_bootstrap=n_bootstrap,
+                    seed=bootstrap_seed,
+                )
+                per_seed_means = matrix.mean(axis=0)
+                pooled_sign = np.sign(float(averaged.mean()))
+                rows.append(
+                    {
+                        "contrast": label,
+                        "period": period_label,
+                        "method": method,
+                        "statistic": statistic,
+                        "n_windows": int(len(matrices)),
+                        "n_seeds": int(matrix.shape[1]),
+                        "n_months": int(len(averaged)),
+                        "effect": float(averaged.mean()),
+                        "hac_t_statistic": float(test["t_statistic"]),
+                        "hac_p_value": float(test["p_value"]),
+                        "ci_lower": float(interval["ci_lower"]),
+                        "ci_upper": float(interval["ci_upper"]),
+                        "excludes_zero": bool(
+                            interval["ci_lower"] > 0 or interval["ci_upper"] < 0
+                        ),
+                        "seed_sign_agreement": (
+                            float((np.sign(per_seed_means) == pooled_sign).mean())
+                            if pooled_sign != 0
+                            else np.nan
+                        ),
+                        "block_length": int(interval["block_length"]),
+                        "n_bootstrap": int(interval["n_bootstrap"]),
+                    }
+                )
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame["hac_q_value"] = benjamini_hochberg(frame["hac_p_value"])
+    return frame
+
+
 def seed_averaged_dispersion_contrasts(
     pairs: Sequence[tuple[Path, Path, str]],
     *,
@@ -539,21 +791,11 @@ def seed_averaged_dispersion_contrasts(
         for method in resolved_methods:
             for statistic in statistics:
                 stat_index = 0 if statistic == "std" else 1
-                per_seed: list[pd.Series] = []
-                for seed_id in common_seeds:
-                    treatment = _series(treatment_seeds[seed_id], method)[stat_index]
-                    control = _series(control_seeds[seed_id], method)[stat_index]
-                    aligned = pd.concat(
-                        [treatment, control], axis=1, join="inner"
-                    ).dropna()
-                    if aligned.empty:
-                        continue
-                    per_seed.append(
-                        (aligned.iloc[:, 0] - aligned.iloc[:, 1]).rename(str(seed_id))
-                    )
-                if not per_seed:
+                matrix = _pair_seed_difference_matrix(
+                    treatment_dir, control_dir, method, stat_index, _series
+                )
+                if matrix is None:
                     continue
-                matrix = pd.concat(per_seed, axis=1)
                 if months is not None:
                     index = pd.DatetimeIndex(matrix.index)
                     matrix = matrix.loc[np.asarray(months(index), dtype=bool)]

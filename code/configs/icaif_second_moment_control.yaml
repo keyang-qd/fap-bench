@@ -1,0 +1,86 @@
+# How much of the data-level effect is control strictness rather than structure?
+#
+# Why this exists
+# ---------------
+# Four reviewers independently raised the same objection, and it is the sharpest
+# the paper received. The headline RQ3 claim compares a data-level effect against
+# a system-level effect whose controls are NOT equally strict: the temporal
+# controls match the row and column sums of A exactly, while the covariate-shift
+# control matches only the pooled first moment. A gap between a family controlled
+# exactly and a family controlled on one moment is precisely what looser control
+# would manufacture. The manuscript discloses this and calls the data-level
+# effects upper bounds -- but a bound of unstated width is not an answer.
+#
+# The width is now measured. The first-moment control leaves a 22% pooled-variance
+# gap against the treatment (0.896 against 1.143 at the strong setting); the
+# second-moment control closes it to 0.03% while keeping cross-client dispersion
+# exactly zero, so it still satisfies Eq. (1). See
+# build_covariate_shift_second_moment_matched_control_parameters for the
+# closed-form derivation.
+#
+# Either outcome is reportable, which is the point of running it:
+#   - effect largely survives  => the separation is structure, not strictness,
+#                                 and the claim upgrades from bound to estimate;
+#   - effect collapses         => the gap was control strictness, and that is the
+#                                 more important finding, to be stated plainly.
+#
+# Only the control arm is new. It pairs against `covariate_shift_strong` in
+# configs/icaif_heterogeneity.yaml, whose 20 seeds this file matches exactly --
+# required, not incidental, since the dispersion estimator uses only seeds common
+# to both sides of a contrast.
+#
+# 1 scenario x 20 seeds = 20 cells.
+#
+# Run:
+#   caffeinate -dims python -u scripts/run_grid.py \
+#       --grid configs/icaif_second_moment_control.yaml \
+#       --data-path /path/to/qdata/data0712.parquet
+
+base_config: crsp_compustat_profitability.yaml
+output_dir: outputs/icaif_publication/second_moment_control
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+
+base_overrides:
+  # Copied from configs/icaif_heterogeneity.yaml so the only difference from the
+  # published contrast is which control builder runs.
+  baselines:
+    centralized: true
+    centralized_masked: false
+    local: false
+  federated:
+    algorithms: [fedavg, scaffold, fedadam]
+    server_lr: 0.003
+
+grid_execution:
+  parallel_runs: 2
+  max_total_client_workers: 6
+  max_total_torch_threads: 6
+  start_method: spawn
+  parallel_child_console: false
+
+child_logging:
+  console: true
+  round_interval: 10
+
+# Identical to configs/icaif_heterogeneity.yaml.
+seeds: [11, 22, 33, 44, 55, 66, 77, 88, 99, 110,
+        121, 132, 143, 154, 165, 176, 187, 198, 209, 220]
+
+scenarios:
+  # location_std / log_scale_std copied verbatim from covariate_shift_strong.
+  # The second-moment builder re-draws the SAME per-client parameters from these
+  # and collapses them differently, so the pairing is exact.
+  - name: covariate_shift_strong_second_moment
+    overrides:
+      statistical_heterogeneity:
+        enabled: true
+        client_size_imbalance: {enabled: false}
+        client_size_matched_control: {enabled: false}
+        label_skew: {enabled: false}
+        covariate_shift: {enabled: false}
+        covariate_shift_matched_control: {enabled: false}
+        covariate_shift_second_moment_control:
+          {enabled: true, location_std: 0.5, log_scale_std: 0.3}
+      federated: {rounds: 50, participation_rate: 1.0, server_lr: 0.003}

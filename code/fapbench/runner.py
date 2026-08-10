@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import platform
 import sys
@@ -56,6 +57,7 @@ from fapbench.partition import (
     assign_domain_clients,
     assign_iid_clients,
     build_covariate_shift_matched_control_parameters,
+    build_covariate_shift_second_moment_matched_control_parameters,
     build_covariate_shift_parameters,
     build_feature_masks,
     build_feature_masks_matched_control,
@@ -66,6 +68,7 @@ from fapbench.partition import (
     temporal_availability_report,
     temporal_unavailability,
 )
+from fapbench.privacy import DPConfig
 from fapbench.utils import (
     close_logger,
     configure_logger,
@@ -342,6 +345,128 @@ def _local_prediction_frame(
         logger.info(
             "local prediction | done | rows=%s | elapsed=%s",
             f"{len(result):,}",
+            format_seconds(time.perf_counter() - started),
+        )
+    return result
+
+
+def _ensemble_local_prediction_frame(
+    models: Mapping[str, torch.nn.Module],
+    frame: pd.DataFrame,
+    features: list[str],
+    target_col: str,
+    date_col: str,
+    entity_col: str,
+    client_col: str,
+    device: str,
+    feature_masks: Mapping[str, np.ndarray] | None = None,
+    target_date_col: str = "target_date",
+    logger: logging.Logger | None = None,
+) -> pd.DataFrame:
+    """Score every test row with every client's model and average the rankings.
+
+    Why this baseline exists
+    ------------------------
+    Federation is not the only way to use K clients' data without pooling it. The
+    cheapest alternative is to train locally, ship the K finished models once, and
+    average their opinions -- no rounds, no coordination, no shared optimizer
+    state. If that matched federated training, the benchmark's central comparison
+    would be uninteresting, so the ensemble has to be measured rather than assumed
+    away.
+
+    Why ranks, not scores
+    ---------------------
+    Independently trained local models are not calibrated against each other --
+    exactly the reason the local-only *portfolio* score is a within-client
+    percentile rank rather than a raw prediction. Averaging raw scores would let
+    one member's scale dominate the ensemble, so what is averaged here is each
+    member's within-month cross-sectional percentile rank. The result is invariant
+    to any monotone rescaling of an individual member, which makes the ensemble a
+    statement about the members' orderings rather than about their calibration.
+
+    Each member scores every stock under *its own* feature mask, so an ensemble
+    member is the model as it was actually trained -- a client that never saw a
+    characteristic does not get it back at inference.
+
+    Unlike the local-only baseline this produces one comparable score per stock, so
+    it is evaluated as a global method: no percentile calibration step, and both
+    portfolio variants apply.
+    """
+    if not models:
+        raise ValueError("The ensemble baseline requires at least one local model.")
+    clients_in_frame = sorted(frame[client_col].astype(str).unique())
+    started = time.perf_counter()
+    if logger is not None:
+        logger.info(
+            "ensemble_local prediction | start | rows=%s | members=%s",
+            f"{len(frame):,}",
+            len(models),
+        )
+    member_ranks: list[pd.DataFrame] = []
+    for member_index, member_id in enumerate(sorted(models), start=1):
+        # Score the whole frame with this one member, under this member's mask.
+        # _prediction_frame looks the mask up per client group, so the member's
+        # mask is broadcast to every client id present in the frame.
+        member_masks = (
+            None
+            if feature_masks is None
+            else {client: feature_masks[member_id] for client in clients_in_frame}
+        )
+        scored = _prediction_frame(
+            models[member_id],
+            frame,
+            features,
+            target_col,
+            date_col,
+            entity_col,
+            client_col,
+            device,
+            member_masks,
+            target_date_col,
+            logger=logger,
+            log_name=f"ensemble_local member={member_id}",
+            client_log_interval=0,
+        )
+        # Percentile rank within each cross-section. `pct=True` with average ranks
+        # for ties matches the local-only calibration, so the two baselines differ
+        # in aggregation and not in how a single model's scores are made comparable.
+        scored["member_rank"] = scored.groupby(date_col)["y_pred"].rank(
+            method="average", pct=True
+        )
+        keep = [date_col, entity_col, client_col, "y_true", "member_rank"]
+        if target_date_col in scored.columns:
+            keep.append(target_date_col)
+        member_ranks.append(scored[keep])
+        if logger is not None:
+            logger.info(
+                "ensemble_local prediction | member=%s/%s | member_id=%s",
+                member_index,
+                len(models),
+                member_id,
+            )
+    stacked = pd.concat(member_ranks, ignore_index=True)
+    group_cols = [date_col, entity_col, client_col, "y_true"]
+    if target_date_col in stacked.columns:
+        group_cols.append(target_date_col)
+    result = (
+        stacked.groupby(group_cols, sort=False, dropna=False)["member_rank"]
+        .mean()
+        .reset_index()
+        .rename(columns={"member_rank": "y_pred"})
+    )
+    # Every member scores every row, so an averaged row count below the original
+    # means rows were silently dropped or the key is not unique -- either would
+    # corrupt the comparison rather than merely weaken it.
+    if len(result) != len(frame):
+        raise ValueError(
+            "Ensemble averaging changed the row count: "
+            f"{len(frame)} predictions in, {len(result)} out."
+        )
+    if logger is not None:
+        logger.info(
+            "ensemble_local prediction | done | rows=%s | members=%s | elapsed=%s",
+            f"{len(result):,}",
+            len(models),
             format_seconds(time.perf_counter() - started),
         )
     return result
@@ -680,6 +805,34 @@ def _evaluate_and_save(
         )
     return result
 
+
+
+COVARIATE_SHIFT_ARMS = (
+    "covariate_shift",
+    "covariate_shift_matched_control",
+    "covariate_shift_second_moment_control",
+)
+
+
+def resolve_covariate_shift_arms(statistical_cfg: dict) -> list[str]:
+    """Return the enabled covariate-shift arms, rejecting more than one.
+
+    Extracted from the runner body so the exclusivity guard is testable without
+    a full training run. Enabling two arms would otherwise silently apply
+    whichever builder happens to be wired last, which would produce a scenario
+    whose directory name no longer describes what was run -- the failure mode
+    hardest to notice after the fact.
+    """
+    enabled = [
+        name
+        for name in COVARIATE_SHIFT_ARMS
+        if bool((statistical_cfg.get(name) or {}).get("enabled", False))
+    ]
+    if len(enabled) > 1:
+        raise ValueError(
+            "Enable at most one covariate-shift arm; got: " + ", ".join(enabled)
+        )
+    return enabled
 
 def run(
     config: dict[str, Any],
@@ -1184,30 +1337,41 @@ def run(
 
         covariate_cfg = statistical_cfg.get("covariate_shift", {})
         matched_covariate_cfg = statistical_cfg.get("covariate_shift_matched_control", {})
-        if bool(covariate_cfg.get("enabled", False)) and bool(
-            matched_covariate_cfg.get("enabled", False)
-        ):
-            raise ValueError(
-                "Enable either covariate_shift or covariate_shift_matched_control, "
-                "not both."
-            )
-        if bool(statistical_cfg.get("enabled", False)) and (
-            bool(covariate_cfg.get("enabled", False))
-            or bool(matched_covariate_cfg.get("enabled", False))
-        ):
-            matched_control = bool(matched_covariate_cfg.get("enabled", False))
-            active_cfg = matched_covariate_cfg if matched_control else covariate_cfg
-            stage_label = (
-                "Apply matched uniform covariate-shift control"
-                if matched_control
-                else "Apply client-specific covariate shift"
-            )
+        # A strictly tighter control: matches the treatment's pooled variance as
+        # well as its pooled mean. Mutually exclusive with the other two arms --
+        # enabling more than one would silently apply the last builder wired here.
+        second_moment_cfg = statistical_cfg.get(
+            "covariate_shift_second_moment_control", {}
+        )
+        enabled_arms = resolve_covariate_shift_arms(statistical_cfg)
+        if bool(statistical_cfg.get("enabled", False)) and enabled_arms:
+            arm = enabled_arms[0]
+            matched_control = arm != "covariate_shift"
+            second_moment = arm == "covariate_shift_second_moment_control"
+            active_cfg = {
+                "covariate_shift": covariate_cfg,
+                "covariate_shift_matched_control": matched_covariate_cfg,
+                "covariate_shift_second_moment_control": second_moment_cfg,
+            }[arm]
+            stage_label = {
+                "covariate_shift": "Apply client-specific covariate shift",
+                "covariate_shift_matched_control": (
+                    "Apply matched uniform covariate-shift control"
+                ),
+                "covariate_shift_second_moment_control": (
+                    "Apply second-moment-matched covariate-shift control"
+                ),
+            }[arm]
             with log_stage(logger, stage_label):
-                builder = (
-                    build_covariate_shift_matched_control_parameters
-                    if matched_control
-                    else build_covariate_shift_parameters
-                )
+                builder = {
+                    "covariate_shift": build_covariate_shift_parameters,
+                    "covariate_shift_matched_control": (
+                        build_covariate_shift_matched_control_parameters
+                    ),
+                    "covariate_shift_second_moment_control": (
+                        build_covariate_shift_second_moment_matched_control_parameters
+                    ),
+                }[arm]
                 locations, scales = builder(
                     clients,
                     features,
@@ -1231,7 +1395,9 @@ def run(
                 statistical_report.update(
                     {
                         "covariate_shift_enabled": not matched_control,
-                        "covariate_shift_matched_control_enabled": matched_control,
+                        "covariate_shift_matched_control_enabled": matched_control
+                        and not second_moment,
+                        "covariate_shift_second_moment_control_enabled": second_moment,
                         "covariate_location_std": float(
                             active_cfg.get("location_std", 0.25)
                         ),
@@ -1484,6 +1650,30 @@ def run(
         baseline_epochs = _resolve_baseline_epochs(config, effective_participation_rate)
         results: list[dict[str, Any]] = []
         baseline_cfg = config.get("baselines", {})
+        # Personalized arm. Off by default so every published result is
+        # byte-identical; `algorithms` names which federated arms to fine-tune
+        # from, and an empty list disables it entirely.
+        finetune_cfg = baseline_cfg.get("finetune_after_federated", {}) or {}
+        finetune_algorithms = (
+            {str(a).lower() for a in finetune_cfg.get("algorithms", ["fedavg"])}
+            if bool(finetune_cfg.get("enabled", False))
+            else set()
+        )
+        finetune_epochs = int(finetune_cfg.get("epochs", 5))
+        if finetune_algorithms and finetune_epochs < 1:
+            raise ValueError("finetune_after_federated.epochs must be >= 1.")
+
+        # Fail here rather than silently skipping the ensemble later: the ensemble
+        # is built from the local baseline's own models, so a config asking for one
+        # without the other is a mistake, and skipping it would leave a missing
+        # method row that looks like a crashed run.
+        if bool(baseline_cfg.get("ensemble_local", False)) and not bool(
+            baseline_cfg.get("local", True)
+        ):
+            raise ValueError(
+                "baselines.ensemble_local requires baselines.local: the ensemble "
+                "aggregates the local baseline's per-client models."
+            )
         epoch_log_interval = int(logging_cfg.get("epoch_interval", 1))
         local_client_log_interval = int(logging_cfg.get("local_client_interval", 1))
         prediction_client_log_interval = int(logging_cfg.get("prediction_client_interval", 1))
@@ -1862,6 +2052,84 @@ def run(
                 write_json(metrics, output_dir / "metrics_local.json")
                 results.append({"method": "local", **metrics})
 
+            # Ensemble of the same local models. Placed inside the local block and
+            # reusing `local_models` on purpose: the ensemble must be built from the
+            # models the local baseline actually reports, or the two rows would not
+            # be a decomposition of the same training run and the comparison would
+            # confound aggregation with training.
+            if bool(baseline_cfg.get("ensemble_local", False)):
+                ensemble_started = time.perf_counter()
+                with log_stage(logger, "Run ensemble-of-locals baseline"):
+                    prediction_started = time.perf_counter()
+                    ensemble_predictions = _ensemble_local_prediction_frame(
+                        local_models,
+                        test,
+                        features,
+                        spec.target_col,
+                        spec.date_col,
+                        spec.entity_col,
+                        "client_id",
+                        device,
+                        feature_masks,
+                        target_date_col=spec.target_date_col,
+                        logger=logger,
+                    )
+                    prediction_elapsed = time.perf_counter() - prediction_started
+                    ensemble_metrics = _evaluate_and_save(
+                        "ensemble_local",
+                        ensemble_predictions,
+                        output_dir,
+                        config,
+                        logger,
+                        # Rank-averaging already puts every member on one comparable
+                        # scale, so this is a global method: no percentile
+                        # calibration, and the global portfolio is meaningful.
+                        is_local=False,
+                    )
+                    # Training is shared with the local baseline, so charging it
+                    # again would double-count. What the ensemble adds is one
+                    # upload of each finished model and no rounds at all -- the
+                    # honest communication comparison against the federated rows,
+                    # which pay per round.
+                    ensemble_metrics["training_elapsed_seconds"] = 0.0
+                    ensemble_metrics["prediction_elapsed_seconds"] = float(
+                        prediction_elapsed
+                    )
+                    ensemble_metrics["training_epochs"] = baseline_epochs
+                    ensemble_metrics["training_local_passes"] = baseline_epochs
+                    ensemble_metrics["ensemble_members"] = int(len(local_models))
+                    # Rank-averaging discards level information by construction, so
+                    # the ensemble's prediction is a cross-sectional percentile, not
+                    # a return. Every squared-error metric computed against realized
+                    # returns is therefore meaningless for this row -- the smoke run
+                    # produces an OOS R^2 of -20 -- and a meaningless number in a
+                    # table is worse than an absent one. Blank them and record why.
+                    ensemble_metrics["prediction_scale"] = "cross_sectional_rank"
+                    for key in list(ensemble_metrics):
+                        if any(
+                            token in key
+                            for token in ("mse", "mae", "oos_r2", "rmse")
+                        ):
+                            ensemble_metrics[key] = float("nan")
+                    member_parameters = sum(
+                        int(sum(p.numel() for p in model.parameters()))
+                        for model in local_models.values()
+                    )
+                    ensemble_metrics["communication_rounds"] = 1
+                    ensemble_metrics[
+                        "selected_checkpoint_communicated_parameters"
+                    ] = member_parameters
+                    ensemble_metrics[
+                        "selected_checkpoint_communicated_bytes_fp32"
+                    ] = 4 * member_parameters
+                    ensemble_metrics["method_elapsed_seconds"] = float(
+                        time.perf_counter() - ensemble_started
+                    )
+                    ensemble_metrics["process_peak_rss_mb"] = process_peak_rss_mb()
+                    write_json(
+                        ensemble_metrics, output_dir / "metrics_ensemble_local.json"
+                    )
+                    results.append({"method": "ensemble_local", **ensemble_metrics})
         performance_cfg = config.get("performance", {})
         parallel_client_count = int(performance_cfg.get("parallel_clients", 1))
         cache_started = time.perf_counter()
@@ -1958,6 +2226,7 @@ def run(
                         server_beta1=float(fed_cfg.get("server_beta1", 0.9)),
                         server_beta2=float(fed_cfg.get("server_beta2", 0.99)),
                         server_tau=float(fed_cfg.get("server_tau", 1e-8)),
+                        dp=DPConfig.from_mapping(fed_cfg.get("dp")),
                         client_optimizer=client_optimizer,
                         client_momentum=client_momentum,
                         logger=logger,
@@ -2001,6 +2270,16 @@ def run(
                     training_history.to_csv(
                         output_dir / f"training_{algorithm}.csv", index=False
                     )
+                    # Per-round DP diagnostics. The clipped fraction and the
+                    # median update norm are how a reader checks that the clip
+                    # norm was calibrated rather than guessed: a run where
+                    # nothing clips is not private in any meaningful sense, and
+                    # one where everything clips has thrown away the signal
+                    # before the noise ever arrives.
+                    if getattr(trainer, "dp_diagnostics", None):
+                        pd.DataFrame(trainer.dp_diagnostics).to_csv(
+                            output_dir / f"dp_diagnostics_{algorithm}.csv", index=False
+                        )
                     calibration_cfg = config.get("evaluation", {}).get(
                         "validation_prediction_calibration", {}
                     )
@@ -2148,6 +2427,102 @@ def run(
                     metrics["process_peak_rss_mb"] = process_peak_rss_mb()
                     write_json(metrics, output_dir / f"metrics_{algorithm}.json")
                     results.append({"method": algorithm, **metrics})
+
+                    # Personalized arm: fine-tune the converged global model on
+                    # each client's own training rows. Three reviewers noted that
+                    # the paper's headline economic finding is a PER-CLIENT cost
+                    # and that personalization is precisely the method class
+                    # designed to reduce it, so evaluating none of that class
+                    # leaves the reader unable to tell whether the cost is
+                    # intrinsic to heterogeneity or an artifact of insisting on
+                    # one global model. This is the cheapest member of the class
+                    # and needs no new training machinery: train_local_models
+                    # already starts every client from model_fn(), so handing it
+                    # a factory that returns the global model turns it into
+                    # per-client fine-tuning, keeping masks, logging, and the
+                    # per-client evaluation path identical to the local baseline.
+                    if algorithm in finetune_algorithms:
+                        finetune_label = f"{algorithm}_finetuned"
+                        method_started = time.perf_counter()
+                        with log_stage(logger, f"Run {finetune_label}"):
+                            global_state = copy.deepcopy(model.state_dict())
+
+                            def _finetune_init() -> Any:
+                                fresh = model_fn()
+                                fresh.load_state_dict(global_state)
+                                return fresh
+
+                            training_started = time.perf_counter()
+                            finetuned_models = train_local_models(
+                                train,
+                                _finetune_init,
+                                features,
+                                spec.target_col,
+                                client_col="client_id",
+                                feature_masks=feature_masks,
+                                epochs=finetune_epochs,
+                                batch_size=int(fed_cfg.get("batch_size", 512)),
+                                learning_rate=client_lr,
+                                weight_decay=float(fed_cfg.get("weight_decay", 0.0)),
+                                device=device,
+                                optimizer_name=client_optimizer,
+                                momentum=client_momentum,
+                                logger=logger,
+                                client_log_interval=local_client_log_interval,
+                                epoch_log_interval=epoch_log_interval,
+                            )
+                            training_elapsed = time.perf_counter() - training_started
+                            prediction_started = time.perf_counter()
+                            finetune_predictions = _local_prediction_frame(
+                                finetuned_models,
+                                test,
+                                features,
+                                spec.target_col,
+                                spec.date_col,
+                                spec.entity_col,
+                                "client_id",
+                                device,
+                                feature_masks,
+                                target_date_col=spec.target_date_col,
+                                logger=logger,
+                                client_log_interval=prediction_client_log_interval,
+                            )
+                            prediction_elapsed = time.perf_counter() - prediction_started
+                            finetune_metrics = _evaluate_and_save(
+                                finetune_label,
+                                finetune_predictions,
+                                output_dir,
+                                config,
+                                logger,
+                                is_local=True,
+                            )
+                            # Communication is the federated run's, unchanged: the
+                            # fine-tuning step is local and uploads nothing.
+                            for key in (
+                                "communicated_bytes_fp32",
+                                "selected_checkpoint_communicated_bytes_fp32",
+                            ):
+                                if key in metrics:
+                                    finetune_metrics[key] = metrics[key]
+                            finetune_metrics["finetune_epochs"] = int(finetune_epochs)
+                            finetune_metrics["finetune_base_method"] = algorithm
+                            finetune_metrics["training_elapsed_seconds"] = float(
+                                training_elapsed
+                            )
+                            finetune_metrics["prediction_elapsed_seconds"] = float(
+                                prediction_elapsed
+                            )
+                            finetune_metrics["method_elapsed_seconds"] = float(
+                                time.perf_counter() - method_started
+                            )
+                            finetune_metrics["process_peak_rss_mb"] = process_peak_rss_mb()
+                            write_json(
+                                finetune_metrics,
+                                output_dir / f"metrics_{finetune_label}.json",
+                            )
+                            results.append(
+                                {"method": finetune_label, **finetune_metrics}
+                            )
 
                     if bool(calibration_cfg.get("enabled", False)) and (
                         algorithm.lower() in calibration_methods

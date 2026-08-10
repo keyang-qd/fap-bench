@@ -13,6 +13,8 @@ import pandas as pd
 import torch
 from torch import nn
 
+from fapbench.privacy import DPConfig, privatise_mean_update
+
 from fapbench.algorithms.common import (
     ClientArrays,
     clone_state_dict,
@@ -87,6 +89,7 @@ class FederatedTrainer:
         multiprocessing_start_method: str = "spawn",
         worker_torch_threads: int = 1,
         cache_client_arrays: bool = True,
+        dp: "DPConfig | None" = None,
     ) -> None:
         algorithm = algorithm.lower()
         if algorithm not in self.SUPPORTED:
@@ -111,6 +114,13 @@ class FederatedTrainer:
         self.server_tau = server_tau
         self.client_optimizer = client_optimizer.lower()
         self.client_momentum = client_momentum
+        self.dp = dp if dp is not None else DPConfig()
+        # A dedicated generator so DP noise never advances the stream that drives
+        # partitioning, initialisation, or client sampling. Without this, turning
+        # DP on would perturb every other random draw and the private and
+        # non-private arms would differ by more than the mechanism.
+        self._dp_generator = torch.Generator().manual_seed(int(seed) + 90210)
+        self.dp_diagnostics: list[dict[str, float]] = []
         self.logger = logger
         self.round_log_interval = max(0, int(round_log_interval))
         self.log_client_details = bool(log_client_details)
@@ -578,7 +588,30 @@ class FederatedTrainer:
                             )
                         )
 
-                averaged_local = weighted_average_states(local_states, local_weights)
+                if self.dp.enabled:
+                    # Client-level DP: clip each client's UPDATE (not its weights),
+                    # average uniformly, and noise the mean. Uniform averaging is
+                    # required for the sensitivity bound to be C/K rather than a
+                    # function of the row distribution -- see fapbench/privacy.py.
+                    deltas = [
+                        OrderedDict(
+                            (k, state[k] - global_state[k]) for k in global_state
+                        )
+                        for state in local_states
+                    ]
+                    mean_delta, dp_stats = privatise_mean_update(
+                        deltas,
+                        clip_norm=self.dp.clip_norm,
+                        noise_multiplier=self.dp.noise_multiplier,
+                        generator=self._dp_generator,
+                    )
+                    dp_stats["round"] = float(round_number)
+                    self.dp_diagnostics.append(dp_stats)
+                    averaged_local = OrderedDict(
+                        (k, global_state[k] + mean_delta[k]) for k in global_state
+                    )
+                else:
+                    averaged_local = weighted_average_states(local_states, local_weights)
                 if self.algorithm == "fedadam":
                     new_state = self._fedadam_update(global_state, averaged_local, round_index)
                 else:

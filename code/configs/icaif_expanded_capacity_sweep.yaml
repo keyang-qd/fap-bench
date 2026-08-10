@@ -1,0 +1,131 @@
+# Stage 1 of W2: does the 20-characteristic panel recover once capacity is
+# re-selected at that width?
+#
+# Why this exists
+# ---------------
+# The most-repeated structural criticism of the paper, raised in some form by
+# four reviewers and stated most sharply by the last, is that its empirical
+# regime may make the headline finding true by construction: seven profitability
+# characteristics and a 2,625-parameter MLP that an 8-parameter ridge beats is a
+# setting where "aggregation-rule choice does not matter" is close to guaranteed
+# a priori.
+#
+# The paper already has a 20-characteristic arm, and it cuts Rank IC by >=46% for
+# every method. The manuscript reads that as a recipe failing to transfer across
+# input widths rather than a verdict on the wider panel -- because
+# `icaif_core_expanded_features.yaml` deliberately holds architecture and
+# optimizer at values tuned for SEVEN inputs (see the model block comment in
+# crsp_compustat_profitability_expanded.yaml). That reading is honest but
+# untested: it asserts the arm is uninformative without showing that a re-tuned
+# arm behaves differently.
+#
+# This sweep tests it. If a wider network at a re-selected learning rate recovers
+# the lost Rank IC, the 20-characteristic result was a tuning artifact and the
+# paper's conclusions must be re-checked at the recovered configuration. If it
+# does not recover, the seven-characteristic default is defensible on evidence
+# rather than assertion, and the "recipe failing to transfer" reading gains real
+# support. Both outcomes are reportable; neither is predictable from here.
+#
+# SELECTION IS VALIDATION-ONLY. Stage 2 runs the winner at 10 seeds and is the
+# only stage whose test metrics are read. fapbench.publication.select_expanded_capacity
+# refuses any metric not prefixed `validation_`, mirroring the existing FedAdam
+# server-rate selection, so this cannot silently become a test-set search.
+#
+# Grid: 4 architectures x 2 client learning rates x 3 seeds = 24 cells, on the
+# reference investable universe. Three seeds because this stage only ranks
+# candidates on validation; the selected configuration is then re-run at 10.
+#
+# Run:
+#   caffeinate -dims python -u scripts/run_grid.py \
+#       --grid configs/icaif_expanded_capacity_sweep.yaml \
+#       --data-path /path/to/qdata/data0712_expanded.parquet
+
+base_config: crsp_compustat_profitability_expanded.yaml
+output_dir: outputs/icaif_publication/expanded_capacity_sweep
+continue_on_error: false
+preload_panel_once: true
+resume_completed: true
+
+base_overrides:
+  # Centralized answers the modelling question (can this model class use 20
+  # characteristics at all); FedAvg checks the selection is not an artifact of
+  # pooling. Local and the masked arm are not needed to rank candidates.
+  baselines:
+    centralized: true
+    centralized_masked: false
+    local: false
+  federated:
+    algorithms: [fedavg]
+    server_lr: 0.003
+  # Reference investable universe, copied verbatim from icaif_core.yaml's
+  # ff12_exclude_microcaps: the sweep must select capacity for the cell the
+  # headline table reports, not for a different universe.
+  universe_filter:
+    enabled: true
+    price_col: prc
+    min_abs_price: 5.0
+    market_cap_col: me
+    exclude_bottom_market_cap_fraction: 0.2
+    breakpoint_exchange_col: exchcd
+    breakpoint_exchange_values: [1]
+
+grid_execution:
+  # 1, not 2, and deliberately. parallel_runs>1 disables preload_panel_once, so
+  # each concurrent run holds its own copy of the panel -- ~2.46 GB here against
+  # ~2.07 GB for the seven-characteristic panel (the 1.0 GB vs 0.57 GB on-disk
+  # gap is mostly compression; this panel has FEWER rows). Two copies plus
+  # training overhead is what rebooted this machine once already, and swap was
+  # already at 6 GB when this grid was queued. Serial costs wall-clock; a crash
+  # costs the queue.
+  parallel_runs: 1
+  max_total_client_workers: 4
+  max_total_torch_threads: 4
+  start_method: spawn
+  parallel_child_console: false
+
+child_logging:
+  console: true
+  round_interval: 10
+
+seeds: [11, 22, 33]
+
+scenarios:
+  # Scenario names must start with `expanded_capacity_` -- select_expanded_capacity
+  # matches on that prefix.
+  #
+  # [64,32] is the reference architecture: including it is what makes the sweep a
+  # test rather than a search, since it lets the selection recover the published
+  # configuration if nothing wider helps.
+  - name: expanded_capacity_h64_32_lr0_01
+    overrides:
+      model: {hidden_dims: [64, 32]}
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.01, server_lr: 0.003}
+  - name: expanded_capacity_h64_32_lr0_003
+    overrides:
+      model: {hidden_dims: [64, 32]}
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.003, server_lr: 0.003}
+  - name: expanded_capacity_h128_64_lr0_01
+    overrides:
+      model: {hidden_dims: [128, 64]}
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.01, server_lr: 0.003}
+  - name: expanded_capacity_h128_64_lr0_003
+    overrides:
+      model: {hidden_dims: [128, 64]}
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.003, server_lr: 0.003}
+  - name: expanded_capacity_h256_128_lr0_01
+    overrides:
+      model: {hidden_dims: [256, 128]}
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.01, server_lr: 0.003}
+  - name: expanded_capacity_h256_128_lr0_003
+    overrides:
+      model: {hidden_dims: [256, 128]}
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.003, server_lr: 0.003}
+  # A depth variant as well as width: the reviewer asked for width/depth/LR.
+  - name: expanded_capacity_h128_64_32_lr0_01
+    overrides:
+      model: {hidden_dims: [128, 64, 32]}
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.01, server_lr: 0.003}
+  - name: expanded_capacity_h128_64_32_lr0_003
+    overrides:
+      model: {hidden_dims: [128, 64, 32]}
+      federated: {rounds: 50, participation_rate: 1.0, local_epochs: 1, client_lr: 0.003, server_lr: 0.003}

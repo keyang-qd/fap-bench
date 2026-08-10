@@ -29,7 +29,12 @@ import pandas as pd
 from scipy import stats as sps
 
 from fapbench import publication
-from fapbench.evaluation.significance import seed_averaged_dispersion_contrasts
+from fapbench.evaluation.significance import (
+    aggregate_seed_significance,
+    combine_seed_tests,
+    rolling_dispersion_contrasts,
+    seed_averaged_dispersion_contrasts,
+)
 from fapbench.publication import (
     HETEROGENEITY_MATCHED_CONTROL_PAIRS,
     IDENTIFICATION_PAIRS,
@@ -343,8 +348,16 @@ def ranking_disagreement_test(
         "kendall_tau": observed,
         "ci_lower": float(lower),
         "ci_upper": float(upper),
-        # The null of one common ordering implies tau = 1.
-        "excludes_perfect_agreement": bool(upper < 1.0),
+        # The null of one common ordering implies tau = 1. Decide exclusion from
+        # the share of draws at tau = 1, not from `upper < 1.0`: Kendall's tau on
+        # K methods is discrete (multiples of 2/(K(K-1))), so a percentile upper
+        # bound can land on 1.0 and still be reported as strictly below it by
+        # one ulp. On the investable universe that floating-point accident
+        # reported "excludes perfect agreement" while 4.7% of draws -- well above
+        # the 2.5% a two-sided 95% interval allows -- actually reached tau = 1.
+        "excludes_perfect_agreement": bool(
+            float(np.mean(draws >= 1.0 - 1e-12)) < 0.025
+        ),
         "share_of_draws_at_perfect_agreement": float(np.mean(draws >= 1.0 - 1e-12)),
         "block_length": int(block_length),
         "n_bootstrap": int(draws.size),
@@ -522,19 +535,151 @@ def capacity_separation_contrasts(
     (seed-averaged monthly differences, HAC + moving-block bootstrap), so the two
     are directly comparable. Empty until the grid has been run.
     """
-    phase_dir = Path(output_root) / CAPACITY_PHASE
+    return _phase_dispersion_contrasts(
+        output_root, CAPACITY_PHASE, CAPACITY_PAIRS, methods=methods
+    )
+
+
+def _phase_dispersion_contrasts(
+    output_root: Path,
+    phase: str,
+    pairs: Sequence[tuple[str, str, str]],
+    *,
+    methods: Sequence[str] = ("fedavg", "scaffold", "fedadam"),
+) -> pd.DataFrame:
+    """Re-measure matched-control dispersion contrasts inside one robustness phase.
+
+    Every RQ3 robustness grid answers the same question at a different setting --
+    higher capacity, the investable universe, a linear model, escalated severity --
+    so they must all be measured with the *identical* estimator as the
+    reference-capacity contrasts (seed-averaged monthly differences, HAC plus
+    moving-block bootstrap) or the comparison of magnitudes is meaningless. Sharing
+    one function is what guarantees that. Empty until the grid has been run.
+    """
+    phase_dir = Path(output_root) / phase
     if not phase_dir.exists():
         return pd.DataFrame()
-    pairs = [
+    resolved = [
         (phase_dir / treatment, phase_dir / control, label)
-        for treatment, control, label in CAPACITY_PAIRS
+        for treatment, control, label in pairs
         if (phase_dir / treatment).is_dir() and (phase_dir / control).is_dir()
     ]
-    if not pairs:
+    if not resolved:
         return pd.DataFrame()
     return seed_averaged_dispersion_contrasts(
-        pairs, methods=list(methods), statistics=("std",)
+        resolved, methods=list(methods), statistics=("std",)
     )
+
+
+# RQ3 at 408 months. Same three pairs as CAPACITY_PAIRS -- the set that spans the
+# separation claim -- but refit over expanding windows so the dispersion contrast
+# is tested on ~408 monthly observations instead of the reference protocol's 60.
+# The tighter covariate-shift control. Cross-phase: the treatment lives in the
+# heterogeneity grid and only the control arm is new, so this cannot use
+# _phase_dispersion_contrasts (which resolves both sides inside one phase).
+SECOND_MOMENT_TREATMENT = ("heterogeneity", "covariate_shift_strong")
+SECOND_MOMENT_CONTROL = (
+    "second_moment_control",
+    "covariate_shift_strong_second_moment",
+)
+
+
+def second_moment_control_contrasts(
+    output_root: Path,
+    *,
+    methods: Sequence[str] = ("fedavg", "scaffold", "fedadam"),
+) -> pd.DataFrame:
+    """Covariate-shift dispersion contrast against a variance-matched control.
+
+    The published contrast controls the pooled first moment only, which leaves a
+    22% pooled-variance gap at the strong setting and makes the reported effect an
+    upper bound of unstated width. This re-measures it against a control matching
+    both moments, using the identical estimator so the two numbers are directly
+    comparable: whatever survives here is not attributable to the looser match.
+    """
+    root = Path(output_root)
+    treatment = root / SECOND_MOMENT_TREATMENT[0] / SECOND_MOMENT_TREATMENT[1]
+    control = root / SECOND_MOMENT_CONTROL[0] / SECOND_MOMENT_CONTROL[1]
+    if not treatment.is_dir() or not control.is_dir():
+        return pd.DataFrame()
+    return seed_averaged_dispersion_contrasts(
+        [(treatment, control, "covariate strong (second-moment control)")],
+        methods=list(methods),
+        statistics=("std",),
+    )
+
+
+RQ3_ROLLING_PHASE = "rq3_rolling"
+RQ3_ROLLING_PAIRS = CAPACITY_PAIRS
+
+
+def rq3_rolling_contrasts(
+    output_root: Path,
+    *,
+    pairs: Sequence[tuple[str, str, str]] = RQ3_ROLLING_PAIRS,
+    methods: Sequence[str] = ("fedavg", "scaffold", "fedadam"),
+    phase: str = RQ3_ROLLING_PHASE,
+) -> pd.DataFrame:
+    """Matched-control dispersion contrasts pooled across expanding-window refits.
+
+    The grid writes one scenario directory per (arm, window) as
+    ``{arm}__refit_{year}``; this discovers the windows present for each pair and
+    hands them to ``rolling_dispersion_contrasts``, which concatenates each
+    contrast's per-window monthly difference series before testing. A window is
+    used only when *both* of its arms are present, so a partially-complete grid
+    yields a shorter series rather than a mismatched one.
+    """
+    phase_dir = Path(output_root) / phase
+    if not phase_dir.exists():
+        return pd.DataFrame()
+
+    labelled: dict[str, list[tuple[Path, Path]]] = {}
+    for treatment, control, label in pairs:
+        windows: list[tuple[Path, Path]] = []
+        for treatment_dir in sorted(phase_dir.glob(f"{treatment}__refit_*")):
+            year = treatment_dir.name.rsplit("__refit_", 1)[-1]
+            control_dir = phase_dir / f"{control}__refit_{year}"
+            if treatment_dir.is_dir() and control_dir.is_dir():
+                windows.append((treatment_dir, control_dir))
+        if windows:
+            labelled[label] = windows
+    if not labelled:
+        return pd.DataFrame()
+    return rolling_dispersion_contrasts(
+        labelled, methods=list(methods), statistics=("std",)
+    )
+
+
+# RQ3 survives the reference screen: the severe feature contrast re-run on the
+# investable universe rather than the unrestricted one the heterogeneity grid used.
+RQ3_INVESTABLE_PAIRS: list[tuple[str, str, str]] = [
+    (
+        "feature_heterogeneity_severe",
+        "feature_heterogeneity_severe_matched",
+        "feature severe (investable)",
+    ),
+]
+
+# The same three pairs that span the separation claim, refit under linear/ridge.
+# Reusing CAPACITY_PAIRS' labels is deliberate: the two tables are meant to be
+# read against each other row for row.
+LINEAR_SEPARATION_PAIRS = CAPACITY_PAIRS
+
+# Escalation ladders. The objection is that the two families are dialled in
+# incommensurable units, so nothing establishes that "severe" masking and a 40%
+# outage block sit at comparable severities. The answer is constructive: push the
+# system-level dials up (outages 40% -> 60% -> 80%, imbalance r=20 -> 50 -> 100)
+# and report where they land. Each rung carries its own matched control.
+SEVERITY_ESCALATION_PAIRS: list[tuple[str, str, str]] = [
+    ("temporal_block_outages_060", "temporal_random_matched_block_060",
+     "block outages 60%"),
+    ("temporal_block_outages_080", "temporal_random_matched_block_080",
+     "block outages 80%"),
+    ("size_imbalance_ratio_50", "size_uniform_matched_ratio_50",
+     "size imbalance r=50"),
+    ("size_imbalance_ratio_100", "size_uniform_matched_ratio_100",
+     "size imbalance r=100"),
+]
 
 
 def block_length_sensitivity(
@@ -585,6 +730,124 @@ def block_length_sensitivity(
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+ENSEMBLE_PHASE = "ensemble_local"
+# Both universes, because RQ2's own finding is that universe construction is the
+# largest lever in the benchmark: an ensemble-versus-federation verdict that held
+# on only one universe would be exactly the protocol-contingent claim the paper
+# warns against.
+ENSEMBLE_SCENARIOS = ("ff12_exclude_microcaps", "ff12_full_participation")
+# Every federated method plus the two things the ensemble has to be read against:
+# `local`, which shares its training and differs only in aggregation, and
+# `centralized`, the pooled upper bound.
+# `centralized` is here because it is the paper's stated economic target ("a net
+# Sharpe distinguishable from Centralized's on the investable universe"), so the
+# ensemble has to be tested against it and not only against the federated rows.
+ENSEMBLE_REFERENCE_METHODS = ("fedavg", "local", "centralized")
+# The metrics that are well defined for a *ranking*. Squared-error metrics are
+# deliberately absent: the ensemble's prediction is a cross-sectional percentile,
+# not a return, so the runner writes them as NaN for that row.
+ENSEMBLE_LEVEL_METRICS = (
+    "rank_ic",
+    "client_neutral_portfolio_net_sharpe",
+    "global_portfolio_net_sharpe",
+    "client_worst_rank_ic",
+    "selected_checkpoint_communicated_bytes_fp32",
+)
+
+
+def ensemble_local_comparison(output_root: Path) -> pd.DataFrame:
+    """Is federation better than averaging the K locally-trained models?
+
+    The paper compares federated training against centralized and local-only
+    training but not against the cheapest alternative: train locally, ship the K
+    finished models once, average their opinions, coordinate nothing. If that
+    matched federated training the benchmark's central comparison would be far
+    less interesting, so it is measured.
+
+    Both reference methods matter and answer different questions. Against
+    `fedavg`, the question is whether coordination earns its rounds. Against
+    `local`, it is how much of the local baseline's deficit is a *training*
+    problem rather than an *aggregation* problem -- the ensemble shares the local
+    baseline's models exactly, so the difference between those two rows is
+    aggregation alone.
+
+    Every method is trained inside the same run as the ensemble, so these are
+    exactly paired: same splits, same client assignment, same market history, no
+    cross-grid assumption. Empty until the grid has been run.
+    """
+    phase_dir = Path(output_root) / ENSEMBLE_PHASE
+    if not phase_dir.exists():
+        return pd.DataFrame()
+    frames: list[pd.DataFrame] = []
+    for scenario in ENSEMBLE_SCENARIOS:
+        scenario_dir = phase_dir / scenario
+        if not scenario_dir.is_dir():
+            continue
+        for reference_method in ENSEMBLE_REFERENCE_METHODS:
+            per_seed_tests, _ = aggregate_seed_significance(
+                scenario_dir,
+                variant="client_neutral",
+                reference_method=reference_method,
+            )
+            if per_seed_tests.empty:
+                continue
+            combined = combine_seed_tests(per_seed_tests)
+            if combined.empty:
+                continue
+            combined = combined.copy()
+            combined.insert(0, "scenario", scenario)
+            frames.append(combined)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def ensemble_local_levels(output_root: Path) -> pd.DataFrame:
+    """Seed-mean levels for the ensemble grid, so the test above has magnitudes.
+
+    A combined p-value with no level beside it is unreadable: "the ensemble does
+    not separate from FedAvg" means something different at Rank IC 0.01 than at
+    0.05. Reported per scenario and method for the metrics that are well defined
+    for a *ranking* -- squared-error metrics are blank for the ensemble row by
+    construction, since its prediction is a percentile rather than a return.
+    """
+    # Read the per-seed files rather than the grid's aggregate `grid_results.csv`:
+    # the aggregate is only written when the whole grid finishes, so depending on it
+    # makes this table unavailable while a long grid is still running, and unusable
+    # if the grid is resumed in pieces.
+    phase_dir = Path(output_root) / ENSEMBLE_PHASE
+    if not phase_dir.exists():
+        return pd.DataFrame()
+    per_seed: list[pd.DataFrame] = []
+    for scenario in ENSEMBLE_SCENARIOS:
+        for seed_dir in sorted((phase_dir / scenario).glob("seed_*")):
+            results_path = seed_dir / "benchmark_results.csv"
+            if not results_path.exists():
+                continue
+            # Subset before adding columns. benchmark_results.csv carries a few
+            # hundred columns and only five are aggregated here, so narrowing
+            # first is both faster and avoids the fragmentation warning that any
+            # column addition on a frame that wide provokes.
+            seed_frame = pd.read_csv(results_path)
+            keep = ["method"] + [
+                column for column in ENSEMBLE_LEVEL_METRICS
+                if column in seed_frame.columns
+            ]
+            per_seed.append(
+                seed_frame[keep].assign(scenario=scenario, seed_dir=seed_dir.name)
+            )
+    if not per_seed:
+        return pd.DataFrame()
+    frame = pd.concat(per_seed, ignore_index=True)
+    metrics = [c for c in ENSEMBLE_LEVEL_METRICS if c in frame.columns]
+    if not metrics:
+        return pd.DataFrame()
+    grouped = (
+        frame.groupby(["scenario", "method"], dropna=False)[metrics]
+        .agg(["mean", "std", "count"])
+    )
+    grouped.columns = [f"{metric}_{stat}" for metric, stat in grouped.columns]
+    return grouped.reset_index()
+
+
 def build_robustness_outputs(
     output_root: Path, panel_path: Path | None = None
 ) -> dict[str, pd.DataFrame]:
@@ -592,6 +855,22 @@ def build_robustness_outputs(
     output_root = Path(output_root)
     tables = {
         "robustness_capacity_separation": capacity_separation_contrasts(output_root),
+        # Named without the `robustness_` prefix because the manuscript cites them
+        # as RQ3 results, not as robustness appendix material, and the manuscript
+        # audit binds these exact filenames.
+        "rq3_investable": _phase_dispersion_contrasts(
+            output_root, "rq3_investable", RQ3_INVESTABLE_PAIRS
+        ),
+        "linear_separation": _phase_dispersion_contrasts(
+            output_root, "linear_separation", LINEAR_SEPARATION_PAIRS
+        ),
+        "severity_escalation": _phase_dispersion_contrasts(
+            output_root, "severity_escalation", SEVERITY_ESCALATION_PAIRS
+        ),
+        "rq3_rolling": rq3_rolling_contrasts(output_root),
+        "second_moment_control": second_moment_control_contrasts(output_root),
+        "ensemble_local_comparison": ensemble_local_comparison(output_root),
+        "ensemble_local_levels": ensemble_local_levels(output_root),
         "robustness_block_length_sensitivity": block_length_sensitivity(output_root),
         "robustness_market_adjusted_alpha": market_adjusted_alpha(
             output_root, panel_path

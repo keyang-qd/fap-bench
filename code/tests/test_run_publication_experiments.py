@@ -86,3 +86,37 @@ def test_ensure_expanded_panel_rebuilds_when_forced(tmp_path: Path, monkeypatch)
         target, raw_data_dir=tmp_path, rebuild=True, log_level="ERROR"
     )
     assert len(calls) == 1
+
+
+def test_extended_phases_are_opt_in_but_complete():
+    """The plan must be the complete manifest, without slowing the default run.
+
+    Two things can go wrong and both are silent. If the extended grids leak into
+    the default `phases`, the documented publication command grows from hours to
+    days. If they are missing from the plan entirely, the paper's claim that every
+    table regenerates from one command is false, because nine grids would only be
+    discoverable by reading the README.
+    """
+    import yaml
+
+    plan = yaml.safe_load(
+        Path("configs/icaif_publication.yaml").read_text(encoding="utf-8")
+    )
+    default_names = {str(phase["name"]) for phase in plan["phases"]}
+    extended_names = {str(phase["name"]) for phase in plan["extended_phases"]}
+    assert not (default_names & extended_names), "a phase is listed in both lists"
+    # Every grid config shipped for the ICAIF suite must appear in exactly one of
+    # the two lists, so adding a grid without registering it fails here.
+    shipped = {
+        path.name
+        for path in Path("configs").glob("icaif_*.yaml")
+        if path.name != "icaif_publication.yaml"
+    }
+    registered = {
+        str(phase["grid"])
+        for phase in list(plan["phases"]) + list(plan["extended_phases"])
+    }
+    assert shipped == registered, (
+        f"unregistered grids: {sorted(shipped - registered)}; "
+        f"missing configs: {sorted(registered - shipped)}"
+    )
