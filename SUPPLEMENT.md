@@ -1,9 +1,8 @@
 # FAP-Bench — Supplement to the Paper
 
-This file holds material released from the manuscript under the 8-page limit.
-Nothing here is new: every item was in an earlier draft and is reproduced so that
-a reader who wants the derivation, the audit figures, or the robustness detail
-can find it. Section numbers refer to the submitted paper.
+This file holds material that did not fit in the paper under its page limit, so
+that a reader who wants the derivation, the audit figures, or the robustness
+detail can find it. Section numbers refer to the published (camera-ready) paper.
 
 Where the paper says "in the artifact" or "in the artifact supplement", the
 material is here. Numerical outputs backing each section are under
@@ -69,6 +68,33 @@ Only the variance comes from the data, never the effect size, so this is a
 *reporting* rule rather than post-hoc power: a cell publishes its MDE beside its
 results, so a null is read against what it could have seen.
 
+### The same gap for Rank IC (paper Table 2, "IC gap" column)
+
+Rank IC is the rank information coefficient: the correlation, within a month,
+between the ranking of stocks by predicted return and their ranking by realized
+return. The paper's one resolved method separation is stated on Rank IC, so each
+408-month cell also publishes the smallest Rank IC gap it can detect. The
+calculation is the one above without the Sharpe scaling: the Newey–West standard
+error of the seed-averaged monthly Rank IC difference against Centralized,
+multiplied by `z_0.975 + z_0.80 ≈ 2.80`. Seeds are held fixed.
+
+| Arm (against Centralized) | Reference cell: observed difference | Reference cell: detectable gap | Widened cell: observed difference | Widened cell: detectable gap |
+|---|---|---|---|---|
+| Local | −0.0036 | 0.0048 | −0.0063 | 0.0052 |
+| FedAvg | −0.0027 | 0.0040 | −0.0067 | 0.0061 |
+| SCAFFOLD | −0.0023 | 0.0038 | −0.0072 | 0.0061 |
+| FedAdam | +0.0052 | 0.0044 | +0.0002 | 0.0057 |
+
+The paper quotes the range across the four arms: 0.0038–0.0048 in the reference
+cell and 0.0052–0.0061 in the widened cell. In the widened cell the FedAvg and
+SCAFFOLD shortfalls exceed the whole range, narrowly. In the reference cell only
+FedAdam's difference exceeds its gap, and the paper does not read that as a
+separation because FedAdam's server optimizer was searched and Centralized's was
+not. No seed-resampled version of this gap has been computed, unlike for net
+Sharpe (S5). The inputs are
+`code/outputs/icaif_publication/paper_tables/rolling_rank_ic_vs_centralized_investable.csv`
+and `rolling_rank_ic_vs_centralized_tuned20.csv`.
+
 ---
 
 ## S3. Matched-control audit — realized figures (paper §3.2)
@@ -89,6 +115,9 @@ recorded and passed over. The per-cell audit ships with the artifact.
 ---
 
 ## S4. Matched-control constructions, family by family (paper §3.2, Table 1)
+
+The camera-ready paper carries a condensed version of this section in its
+"Constructions" paragraph. The fuller statements follow.
 
 **Covariate shift.** The control reuses the treatment's own realized draws. The
 treatment gives each client its own location and scale; the control averages
@@ -187,9 +216,36 @@ We correct over two families and never pool them.
 
 **Declared family — 74 matched-control contrasts.** `(5 × 5) + (3 × 4)`
 contrast–method pairs on two statistics (standard deviation and worst-client).
-Benjamini–Hochberg runs once over this family, and **only this family carries q
-values**.
+Benjamini–Hochberg runs once over this family.
 
-**Descriptive family — method comparisons made inside cells.** These are counted
-but not corrected as a family; the artifact lists which nominal hits survive
-correction and which do not.
+**Descriptive family — method comparisons made inside cells.** Benjamini–Hochberg
+runs separately over this family. It holds 98 tests, of which 27 are significant
+before correction and 21 remain so after it. The paper writes `q` for a value
+that carries its family's correction and `p` for one that does not. The full
+list, with both values per test, is
+`code/outputs/icaif_publication/paper_tables/descriptive_test_census.csv`.
+
+---
+
+## S7. Local work: fifty rounds of one epoch against ten rounds of five (paper §4.2)
+
+The paper's default spends its training budget as 50 rounds of one local epoch
+(a local epoch is one pass by a client over its own data between two rounds of
+communication). Short local work keeps clients from drifting apart, which is the
+problem the aggregation rules exist to correct, so it could hide differences
+among them. Spending the same budget as 10 rounds of five epochs tests that. On
+the 60-month cell with the investable universe:
+
+| Rule | Rank IC, 50 × 1 | Rank IC, 10 × 5 | Communication, 50 × 1 (MB) | Communication, 10 × 5 (MB) |
+|---|---|---|---|---|
+| FedAvg | 0.0058 | 0.0045 | 8.74 | 1.81 |
+| FedProx | 0.0058 | 0.0045 | 8.74 | 1.81 |
+| SCAFFOLD | 0.0063 | 0.0058 | 16.73 | 3.38 |
+| FedAdam | 0.0180 | 0.0099 | 4.44 | 1.44 |
+| Spread across the four rules | 0.0122 | 0.0055 | | |
+
+More local work narrows the spread among the rules instead of widening it. This
+is descriptive only, because the 60-month cell cannot rank arms (paper Table 2).
+Communication is the volume exchanged up to the selected checkpoint. The inputs
+are `main_results.csv` and `main_results_10x5.csv` under
+`code/outputs/icaif_publication/paper_tables/`.
