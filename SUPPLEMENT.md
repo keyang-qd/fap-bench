@@ -244,8 +244,48 @@ the 60-month cell with the investable universe:
 | FedAdam | 0.0180 | 0.0099 | 4.44 | 1.44 |
 | Spread across the four rules | 0.0122 | 0.0055 | | |
 
-More local work narrows the spread among the rules instead of widening it. This
-is descriptive only, because the 60-month cell cannot rank arms (paper Table 2).
 Communication is the volume exchanged up to the selected checkpoint. The inputs
 are `main_results.csv` and `main_results_10x5.csv` under
 `code/outputs/icaif_publication/paper_tables/`.
+
+The same comparison was run on two more 60-month panels. The spread is the
+largest Rank IC among the four rules minus the smallest.
+
+| Panel | Spread, 50 × 1 | Spread, 10 × 5 |
+|---|---|---|
+| Seven characteristics, investable universe (the table above) | 0.0122 | 0.0055 |
+| Seven characteristics, unrestricted universe | 0.0244 | 0.0111 |
+| Expanded characteristics, unrestricted universe | 0.0156 | 0.0140 |
+
+On all three panels more local work narrows the spread among the rules instead
+of widening it. This is descriptive only, because the 60-month cell cannot rank
+arms (paper Table 2). The inputs for the last two rows are the
+`ff12_full_participation` and `ff12_more_local_steps` scenarios in
+`code/outputs/icaif_publication/core/grid_summary.csv` and
+`core_expanded_features/grid_summary.csv`.
+
+---
+
+## S8. Turnover in the widened cell (paper §4.2)
+
+Turnover is the share of the portfolio that is traded each month: one half of
+the sum of absolute changes in portfolio weights. The paper charges a
+transaction cost in proportion to it, so an arm that trades more loses more to
+costs. The paper states that the transaction-cost model does not create the
+shortfall of the two averaging rules, because the winning arm is the one that
+trades most. The figures behind that statement, for the client-neutral
+portfolio over the 408 test months, averaged over the ten seeds:
+
+| Arm | Mean monthly turnover |
+|---|---|
+| Centralized | 0.970 |
+| FedAvg | 0.846 |
+| SCAFFOLD | 0.842 |
+| FedAdam | 0.845 |
+| Local | 0.831 |
+
+Centralized trades more than every other arm, so raising the cost per unit of
+turnover would reduce its net return the most. Each figure is the mean of the
+`turnover` column over all 340 window–seed files named
+`portfolio_returns_client_neutral_<arm>.csv` under
+`code/outputs/icaif_publication/rolling_refit_investable_tuned20/`.
