@@ -4,9 +4,15 @@ This file holds material that did not fit in the paper under its page limit, so
 that a reader who wants the derivation, the audit figures, or the robustness
 detail can find it. Section numbers refer to the published (camera-ready) paper.
 
-Where the paper says "in the artifact" or "in the artifact supplement", the
-material is here. Numerical outputs backing each section are under
-`code/outputs/icaif_publication/`.
+Where the paper says "in the supplement", the material is here.
+
+**Result files are not included in this repository.** The paper's numbers are
+computed from CRSP (the Center for Research in Security Prices) and Compustat,
+two commercial databases that require a subscription, and the full outputs are
+about 40 GB. Running the publication command in `code/README.md` with access to
+that data regenerates every result and writes it to
+`code/outputs/icaif_publication/`. Every file path in this document that starts
+with `code/outputs/` refers to that regenerated folder.
 
 ---
 
@@ -62,7 +68,8 @@ at the same bandwidth:
 | Reference — FedAdam | Eq. (3) is **conservative by a wide margin**: 0.51 against 0.35 |
 
 **Every null in the paper survives the substitution.** The per-cell comparison is
-in the artifact outputs.
+written to `code/outputs/icaif_publication/paper_tables/` by the publication run
+(`sharpe_mde_delta_method_check.csv` and `sharpe_mde_delta_method_check_tuned20.csv`).
 
 Only the variance comes from the data, never the effect size, so this is a
 *reporting* rule rather than post-hoc power: a cell publishes its MDE beside its
@@ -110,7 +117,7 @@ and `rolling_rank_ic_vs_centralized_tuned20.csv`.
 
 The tolerance binds only for size, which retains whole firms. The pipeline exits
 non-zero on a breach, so a broken control fails the benchmark instead of being
-recorded and passed over. The per-cell audit ships with the artifact.
+recorded and passed over. Each run writes its own per-cell audit alongside its outputs.
 
 ---
 
